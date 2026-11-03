@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Build and test only; nothing here needs to write to the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same Zig version as build.zig.zon's minimum_zig_version.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+
+      # Zig 0.17 keeps fetched packages (ghostty and its deps) in zig-pkg/.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: zig-pkg
+          key: zig-pkg-${{ hashFiles('build.zig.zon') }}
+
+      - name: Check formatting
+        run: zig fmt --check src build.zig build.zig.zon
+
+      - name: Build
+        run: zig build --summary all
+
+      - name: Test (unit tests and end-to-end tests against the real binary)
+        run: zig build test --summary all
