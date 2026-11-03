@@ -398,7 +398,7 @@ test "attach types into the program and Ctrl-\\ detaches" {
     const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-a{d}", .{std.c.getpid()});
     try sys.mkdirAll(runtime);
     defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
-    try spawnDen(runtime, "att", &.{ "/bin/sh", "-c", "echo ready; read x; echo \"got $x\"; sleep 60" }, "0s");
+    try spawnDen(runtime, "att", &.{ "/bin/sh", "-c", "echo ready; read x; seq 1 20000; echo \"got $x\"; sleep 60" }, "0s");
     const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/att.sock", .{runtime});
     defer gpa.free(sock);
     defer if (sys.connectUnix(sock)) |fd| {
@@ -424,6 +424,8 @@ test "attach types into the program and Ctrl-\\ detaches" {
     if (pid == 0) {
         _ = sys.setenv("XDG_RUNTIME_DIR", rt, 1);
         _ = sys.setenv("XDG_STATE_HOME", state, 1);
+        // Some shells leave the terminal non-blocking; attach must cope.
+        sys.setNonblock(1) catch {};
         _ = sys.execvp(bin, &argv);
         std.c._exit(127);
     }
@@ -436,6 +438,7 @@ test "attach types into the program and Ctrl-\\ detaches" {
     _ = std.c.write(master, "\x1b]11;rgb:1010/2020/3030\x1b\\\x1b[?62c", 30);
     try readUntil(master, &seen, "ready");
     _ = std.c.write(master, "hello\r", 6);
+    sys.sleepMs(300); // let the output back up so writes to the terminal stall
     try readUntil(master, &seen, "got hello");
     _ = std.c.write(master, "\x1c", 1);
     try readUntil(master, &seen, "detached");

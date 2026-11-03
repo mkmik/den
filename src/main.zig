@@ -425,11 +425,23 @@ test parseRgb {
     try std.testing.expectEqual(@as(?[3]u8, null), parseRgb("\x1b[?62c", "]10;rgb:"));
 }
 
+/// Write all of `data`. The terminal may be non-blocking (the file is
+/// shared with the shell, and some shells leave it that way), and signals
+/// such as SIGWINCH interrupt writes, so both just mean "try again".
 fn writeAll(fd: std.c.fd_t, data: []const u8) bool {
     var rest = data;
     while (rest.len > 0) {
         const n = std.c.write(fd, rest.ptr, rest.len);
-        if (n <= 0) return false;
+        if (n < 0) switch (std.c.errno(n)) {
+            .INTR => continue,
+            .AGAIN => {
+                var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+                _ = std.posix.poll(&pfd, -1) catch return false;
+                continue;
+            },
+            else => return false,
+        };
+        if (n == 0) return false;
         rest = rest[@intCast(n)..];
     }
     return true;
@@ -451,7 +463,7 @@ fn isHelp(arg: []const u8) bool {
 }
 
 fn out(msg: []const u8) void {
-    _ = std.c.write(1, msg.ptr, msg.len);
+    _ = writeAll(1, msg);
 }
 
 /// Bad usage or input: exit 2.
@@ -465,10 +477,12 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 fn exitWith(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
-    if (saved_termios) |t| std.posix.tcsetattr(0, .FLUSH, t) catch {};
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
-    _ = std.c.write(2, msg.ptr, msg.len);
+    _ = writeAll(2, msg);
+    // DRAIN: wait until the terminal has read everything. Closing a
+    // non-blocking terminal throws away output it has not read yet.
+    if (saved_termios) |t| std.posix.tcsetattr(0, .DRAIN, t) catch {};
     std.process.exit(code);
 }
 
