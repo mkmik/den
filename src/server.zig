@@ -178,16 +178,15 @@ pub const Server = struct {
         const a = arena.allocator();
 
         // Everything the child needs is prepared before fork.
-        const shell: []const []const u8 = &.{std.mem.span(c.getenv("SHELL") orelse "/bin/sh")};
-        const cmd = if (spec_.command.len > 0) spec_.command else shell;
+        const envp = try childEnv(a, spec_.env, spec_.inheritEnv, s.socket_path);
+        // No command: the user's shell as a login shell ("-zsh"), as login(1) starts it.
+        const shell = envGet(envp, "SHELL") orelse "/bin/sh";
+        const login_shell = [_][]const u8{try std.fmt.allocPrint(a, "-{s}", .{std.fs.path.basename(shell)})};
+        const cmd = if (spec_.command.len > 0) spec_.command else &login_shell;
+        const file = if (spec_.command.len > 0) try a.dupeSentinel(u8, cmd[0], 0) else try a.dupeSentinel(u8, shell, 0);
         const argv = try a.allocSentinel(?[*:0]const u8, cmd.len, null);
         for (cmd, 0..) |arg, i| argv[i] = try a.dupeSentinel(u8, arg, 0);
         const cwd = if (spec_.workingDir) |d| try a.dupeSentinel(u8, d, 0) else null;
-        var env: std.ArrayList([2][*:0]const u8) = .empty;
-        try env.append(a, .{ "TERM", "xterm-256color" });
-        // Tells the program, and any den run inside it, which den it is in.
-        try env.append(a, .{ "DEN_SOCKET", s.socket_path });
-        for (spec_.env) |e| try env.append(a, .{ try a.dupeSentinel(u8, e.name, 0), try a.dupeSentinel(u8, e.value, 0) });
 
         var ws = s.winsize();
         var master: c_int = -1;
@@ -195,12 +194,13 @@ pub const Server = struct {
         if (pid < 0) return error.ForkPtyFailed;
         if (pid == 0) {
             sys.resetSignals();
-            for (env.items) |kv| _ = sys.setenv(kv[0], kv[1], 1);
+            // execvp searches the new PATH.
+            c.environ = @ptrCast(@constCast(envp.ptr));
             if (cwd) |d| if (c.chdir(d) != 0) {
                 sys.childFail("chdir", d);
             };
-            _ = sys.execvp(argv[0].?, argv.ptr);
-            sys.childFail("exec", argv[0].?);
+            _ = sys.execvp(file, argv.ptr);
+            sys.childFail("exec", file);
         }
         s.master = master;
         s.pid = pid;
@@ -680,4 +680,78 @@ fn cwdPath(pwd: []const u8) []const u8 {
 test cwdPath {
     try std.testing.expectEqualStrings("/home/m", cwdPath("file://host/home/m"));
     try std.testing.expectEqualStrings("/x", cwdPath("/x"));
+}
+
+/// The program's environment as a null-terminated "NAME=value" list:
+/// a fresh login environment from the password entry, like login(1) makes,
+/// then the variables of den's own environment that `inherit` names, then
+/// TERM, DEN_SOCKET and the spec's env. Which variables to pass through is the spec
+/// writer's call, not den's.
+fn childEnv(a: std.mem.Allocator, extra: []const spec.EnvVar, inherit: []const []const u8, socket: []const u8) ![:null]?[*:0]const u8 {
+    var m: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    try m.put(a, "PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+    if (c.getpwuid(c.getuid())) |pw| {
+        if (pw.name) |n| {
+            try m.put(a, "USER", std.mem.span(n));
+            try m.put(a, "LOGNAME", std.mem.span(n));
+        }
+        if (pw.dir) |d| try m.put(a, "HOME", std.mem.span(d));
+        if (pw.shell) |sh| if (sh[0] != 0) try m.put(a, "SHELL", std.mem.span(sh));
+    }
+    var i: usize = 0;
+    while (c.environ[i]) |kv| : (i += 1) {
+        const s = std.mem.span(kv);
+        const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
+        for (inherit) |pat| if (envMatch(pat, s[0..eq])) {
+            try m.put(a, s[0..eq], s[eq + 1 ..]);
+            break;
+        };
+    }
+    try m.put(a, "TERM", "xterm-256color");
+    // Tells the program, and any den run inside it, which den it is in.
+    try m.put(a, "DEN_SOCKET", socket);
+    for (extra) |e| try m.put(a, e.name, e.value);
+    const out = try a.allocSentinel(?[*:0]const u8, m.count(), null);
+    for (m.keys(), m.values(), 0..) |k, v, j| out[j] = try std.fmt.allocPrintSentinel(a, "{s}={s}", .{ k, v }, 0);
+    return out;
+}
+
+/// An exact name, or a prefix ending in `*` ("LC_*"; "*" matches all).
+fn envMatch(pat: []const u8, name: []const u8) bool {
+    if (std.mem.endsWith(u8, pat, "*")) return std.mem.startsWith(u8, name, pat[0 .. pat.len - 1]);
+    return std.mem.eql(u8, pat, name);
+}
+
+fn envGet(envp: [:null]?[*:0]const u8, name: []const u8) ?[]const u8 {
+    for (envp) |kv| {
+        const s = std.mem.span(kv.?);
+        if (s.len > name.len and s[name.len] == '=' and std.mem.startsWith(u8, s, name)) return s[name.len + 1 ..];
+    }
+    return null;
+}
+
+test childEnv {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extra = [_]spec.EnvVar{ .{ .name = "FOO", .value = "bar" }, .{ .name = "PATH", .value = "/x" } };
+    const fresh = try childEnv(a, &extra, &.{}, "/s");
+    try std.testing.expectEqualStrings("bar", envGet(fresh, "FOO").?);
+    try std.testing.expectEqualStrings("/x", envGet(fresh, "PATH").?);
+    try std.testing.expectEqualStrings("xterm-256color", envGet(fresh, "TERM").?);
+    try std.testing.expect(envGet(fresh, "HOME") != null);
+    try std.testing.expectEqualStrings("/s", envGet(fresh, "DEN_SOCKET").?);
+    // The test runner's environment does not leak in unless asked.
+    for (fresh) |kv| try std.testing.expect(!std.mem.startsWith(u8, std.mem.span(kv.?), "ZIG_"));
+    const all = try childEnv(a, &extra, &.{"*"}, "/s");
+    try std.testing.expect(all.len >= fresh.len);
+    try std.testing.expectEqualStrings("/x", envGet(all, "PATH").?);
+}
+
+test envMatch {
+    try std.testing.expect(envMatch("LANG", "LANG"));
+    try std.testing.expect(!envMatch("LANG", "LANGUAGE"));
+    try std.testing.expect(envMatch("LC_*", "LC_ALL"));
+    try std.testing.expect(!envMatch("LC_*", "LANG"));
+    try std.testing.expect(envMatch("*", "ANYTHING"));
 }
