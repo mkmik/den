@@ -1,0 +1,392 @@
+//! End-to-end: run the real den binary and talk to it over its socket.
+
+const std = @import("std");
+const vt = @import("ghostty-vt");
+const proto = @import("proto.zig");
+const sys = @import("sys.zig");
+const den_bin = @import("build_options").den_bin;
+
+const testing = std.testing;
+const gpa = testing.allocator;
+
+const Conn = struct {
+    fd: std.c.fd_t,
+    buf: std.ArrayList(u8) = .empty,
+    frame: std.ArrayList(u8) = .empty,
+
+    fn open(path: []const u8) !Conn {
+        // den has forked into the background by now, but give it a moment.
+        for (0..100) |_| {
+            if (sys.connectUnix(path)) |fd| return .{ .fd = fd } else |_| sys.sleepMs(20);
+        }
+        return error.ConnectFailed;
+    }
+
+    fn close(c: *Conn) void {
+        _ = std.c.close(c.fd);
+        c.buf.deinit(gpa);
+        c.frame.deinit(gpa);
+    }
+
+    fn send(c: *Conn, t: proto.Type, parts: []const []const u8) !void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try proto.append(gpa, &out, t, parts);
+        if (std.c.write(c.fd, out.items.ptr, out.items.len) != out.items.len) return error.WriteFailed;
+    }
+
+    fn attach(c: *Conn, cols: u16, rows: u16) !void {
+        try c.send(.attach, &.{ &proto.le(u16, cols), &proto.le(u16, rows), &.{1} });
+    }
+
+    /// Next frame; its payload stays valid until the next call.
+    fn next(c: *Conn) !proto.Frame {
+        while (true) {
+            if (try proto.next(c.buf.items, proto.max_den_frame)) |r| {
+                const f, const len = r;
+                c.frame.clearRetainingCapacity();
+                try c.frame.appendSlice(gpa, f.payload);
+                std.mem.copyForwards(u8, c.buf.items, c.buf.items[len..]);
+                c.buf.shrinkRetainingCapacity(c.buf.items.len - len);
+                return .{ .type = f.type, .payload = c.frame.items };
+            }
+            var pfd = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&pfd, 5000) == 0) return error.Timeout;
+            var tmp: [64 * 1024]u8 = undefined;
+            const n = std.c.read(c.fd, &tmp, tmp.len);
+            if (n <= 0) return error.Closed;
+            try c.buf.appendSlice(gpa, tmp[0..@intCast(n)]);
+        }
+    }
+
+    /// Feed snapshot/output frames into `term` until an event contains `want`.
+    fn until(c: *Conn, term: *vt.Terminal, want: []const u8) !void {
+        var stream = term.vtStream();
+        defer stream.deinit();
+        while (true) {
+            const f = try c.next();
+            switch (f.type) {
+                .snapshot, .output => stream.nextSlice(f.payload[8..]),
+                .event => if (std.mem.indexOf(u8, f.payload, want) != null) return,
+                else => {},
+            }
+        }
+    }
+};
+
+/// Write a Den spec for `command` under `runtime` and start den on it.
+fn spawnDen(runtime: []const u8, name: []const u8, command: []const []const u8, keep: []const u8) !void {
+    const json = try std.json.Stringify.valueAlloc(gpa, .{
+        .apiVersion = "den.mkm.pub/v1alpha1",
+        .kind = "Den",
+        .metadata = .{ .name = name, .namespace = "test" },
+        .spec = .{ .command = command, .history = .{ .keepAfterExit = keep } },
+    }, .{});
+    defer gpa.free(json);
+    const spec_path = try std.fmt.allocPrint(gpa, "{s}/{s}.json", .{ runtime, name });
+    defer gpa.free(spec_path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = spec_path, .data = json });
+    const spec_url = try std.fmt.allocPrint(gpa, "file://{s}", .{spec_path});
+    defer gpa.free(spec_url);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("XDG_RUNTIME_DIR", runtime);
+    const state = try std.fmt.allocPrint(gpa, "{s}/state", .{runtime});
+    defer gpa.free(state);
+    try env.put("XDG_STATE_HOME", state);
+    var child = try std.process.spawn(testing.io, .{
+        .argv = &.{ den_bin, "spawn", "--spec", spec_url },
+        .environ_map = &env,
+        .stdout = .ignore,
+    });
+    try testing.expect((try child.wait(testing.io)).success());
+}
+
+/// `den history` over the socket: plain text, caller frees.
+fn history(sock: []const u8) ![]u8 {
+    var h = try Conn.open(sock);
+    defer h.close();
+    try h.send(.history, &.{&.{0}});
+    const f = try h.next();
+    try testing.expectEqual(proto.Type.history, f.type);
+    return gpa.dupe(u8, f.payload);
+}
+
+fn newTerm() !vt.Terminal {
+    return vt.Terminal.init(testing.io, gpa, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+}
+
+fn contains(term: *vt.Terminal, needle: []const u8) !bool {
+    const all = try term.screens.active.dumpStringAlloc(gpa, .{ .screen = .{} });
+    defer gpa.free(all);
+    return std.mem.indexOf(u8, all, needle) != null;
+}
+
+// The zmx#297 scenario, end to end: detach while a program is on the
+// alternate screen, reattach with a fresh terminal, let the program leave
+// the alternate screen. The main screen and its scrollback must be there.
+test "reattach on the alternate screen keeps main screen history" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+
+    const script =
+        \\i=0; while [ $i -lt 40 ]; do echo "line $i"; i=$((i+1)); done
+        \\printf '\033]2;my title\007\033[?1049h\033[HALT SCREEN'
+        \\read x
+        \\printf '\033[?1049l'
+        \\echo "after $x"
+        \\exit 3
+    ;
+    try spawnDen(runtime, "e2e", &.{ "/bin/sh", "-c", script }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/e2e.sock", .{runtime});
+    defer gpa.free(sock);
+    // If the test fails midway, kill the program so den exits too.
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.attach(80, 24) catch {};
+        k.send(.signal, &.{&.{@intCast(@backingInt(std.c.SIG.KILL))}}) catch {};
+    } else |_| {};
+
+    // First client: watch until the program is on the alternate screen, then leave.
+    {
+        var conn = try Conn.open(sock);
+        defer conn.close();
+        try conn.attach(80, 24);
+        var term = try newTerm();
+        defer term.deinit(gpa);
+        try conn.until(&term, "\"screen\":\"alternate\"");
+        try conn.send(.detach, &.{});
+    }
+
+    // Second client, fresh terminal: the snapshot must carry both screens.
+    var conn = try Conn.open(sock);
+    defer conn.close();
+    try conn.attach(80, 24);
+    var term = try newTerm();
+    defer term.deinit(gpa);
+    try conn.until(&term, "\"phase\":\"Running\""); // the full state that follows the snapshot
+    try testing.expectEqual(.alternate, term.screens.active_key);
+    try testing.expect(try contains(&term, "ALT SCREEN"));
+    try testing.expectEqualStrings("my title", term.getTitle().?);
+
+    // History while on the alternate screen: main screen first, then ALT.
+    const live = try history(sock);
+    defer gpa.free(live);
+    try testing.expect(std.mem.startsWith(u8, live, "line 0\nline 1\n"));
+    try testing.expect(std.mem.endsWith(u8, live, "line 39\nALT SCREEN\n"));
+
+    try conn.send(.input, &.{"bye\r"});
+    try conn.until(&term, "\"exitCode\":3");
+    try testing.expectEqual(.primary, term.screens.active_key);
+    try testing.expect(try contains(&term, "line 0\n"));
+    try testing.expect(try contains(&term, "line 39\n"));
+    try testing.expect(try contains(&term, "after bye"));
+    try testing.expect(!try contains(&term, "ALT SCREEN"));
+}
+
+test "status and shutdown work without attaching" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-k{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    // Lots of output, so den has to stop the program while the PTY still
+    // holds unread output. That used to deadlock: den waited for the program
+    // without reading, and the program could not finish exiting.
+    try spawnDen(runtime, "busy", &.{ "/bin/sh", "-c", "awk 'BEGIN{for(i=0;i<20000;i++) printf \"line %d %0100d\\n\", i, 0}'; sleep 60" }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/busy.sock", .{runtime});
+    defer gpa.free(sock);
+
+    var st = try Conn.open(sock);
+    defer st.close();
+    try st.send(.status, &.{});
+    const f = try st.next();
+    try testing.expectEqual(proto.Type.status, f.type);
+    const res = try std.json.parseFromSlice(std.json.Value, gpa, f.payload, .{});
+    defer res.deinit();
+    try testing.expectEqualStrings("busy", res.value.object.get("metadata").?.object.get("name").?.string);
+    const status = res.value.object.get("status").?.object;
+    try testing.expectEqualStrings("Running", status.get("phase").?.string);
+    try testing.expectEqual(0, status.get("clients").?.integer);
+    try testing.expect(status.get("pid").?.integer > 0);
+    try testing.expectEqualStrings(sock, status.get("socket").?.string);
+
+    sys.sleepMs(1000); // awk is done, den is still working through its output
+    var k = try Conn.open(sock);
+    defer k.close();
+    try k.send(.shutdown, &.{});
+    while (true) _ = k.next() catch |err| {
+        try testing.expectEqual(error.Closed, err);
+        break;
+    };
+    try testing.expectError(error.ConnectFailed, sys.connectUnix(sock));
+}
+
+// After the program exits, den writes the final screen to a file, frees the
+// emulator, and serves attaches from the file until it exits.
+test "an exited den serves its final screen from a file" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-f{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    const script =
+        \\i=0; while [ $i -lt 30 ]; do echo "line $i"; i=$((i+1)); done
+        \\printf '\033]2;done\007'
+        \\exit 4
+    ;
+    try spawnDen(runtime, "frozen", &.{ "/bin/sh", "-c", script }, "1h");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/frozen.sock", .{runtime});
+    defer gpa.free(sock);
+    const final = try std.fmt.allocPrint(gpa, "{s}/state/den/test/frozen.final", .{runtime});
+    defer gpa.free(final);
+    // keepAfterExit is 1h: make sure den goes away even if the test fails.
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.send(.shutdown, &.{}) catch {};
+        while (true) _ = k.next() catch break;
+    } else |_| {};
+
+    // Wait for the exit; den writes the file right after.
+    for (0..100) |_| {
+        var st = try Conn.open(sock);
+        defer st.close();
+        try st.send(.status, &.{});
+        if (std.mem.indexOf(u8, (try st.next()).payload, "\"exitCode\":4") != null) break;
+        sys.sleepMs(50);
+    } else return error.NeverExited;
+    try std.Io.Dir.cwd().access(testing.io, final, .{});
+
+    var conn = try Conn.open(sock);
+    defer conn.close();
+    try conn.attach(80, 24);
+    var term = try newTerm();
+    defer term.deinit(gpa);
+    try conn.until(&term, "\"phase\":\"Exited\"");
+    try testing.expect(try contains(&term, "line 0\n"));
+    try testing.expect(try contains(&term, "line 29"));
+    try testing.expectEqualStrings("done", term.getTitle().?);
+
+    // History after exit is rebuilt from the file.
+    const final_text = try history(sock);
+    defer gpa.free(final_text);
+    try testing.expect(std.mem.startsWith(u8, final_text, "line 0\n"));
+    try testing.expect(std.mem.endsWith(u8, final_text, "line 29\n"));
+
+    var k = try Conn.open(sock);
+    defer k.close();
+    try k.send(.shutdown, &.{});
+    while (true) _ = k.next() catch break;
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, final, .{}));
+}
+
+test "send types without attaching; watch-only clients cannot type" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-s{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    try spawnDen(runtime, "typer", &.{ "/bin/sh", "-c", "read x; echo \"got $x\"; sleep 60" }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/typer.sock", .{runtime});
+    defer gpa.free(sock);
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.send(.shutdown, &.{}) catch {};
+        while (true) _ = k.next() catch break;
+    } else |_| {};
+
+    var watcher = try Conn.open(sock);
+    defer watcher.close();
+    try watcher.send(.attach, &.{ &proto.le(u16, 80), &proto.le(u16, 24), &.{0} });
+    try watcher.send(.input, &.{"nope\r"});
+
+    // What `den send` does: input, then status to know it was handled.
+    var sender = try Conn.open(sock);
+    defer sender.close();
+    try sender.send(.input, &.{"hello\r"});
+    try sender.send(.status, &.{});
+    try testing.expectEqual(proto.Type.status, (try sender.next()).type);
+
+    for (0..100) |_| {
+        const h = try history(sock);
+        defer gpa.free(h);
+        if (std.mem.indexOf(u8, h, "got hello") != null) {
+            try testing.expect(std.mem.indexOf(u8, h, "nope") == null);
+            break;
+        }
+        sys.sleepMs(20);
+    } else return error.InputNeverArrived;
+}
+
+// Programs like vim ask the terminal questions and wait for answers. den
+// answers all of them, using the display the last client described, and
+// cuts them out of the output clients get, so their terminals don't answer
+// a second time.
+test "den answers terminal queries and clients never see them" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-q{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    const script =
+        \\ask() { stty -icanon -echo min 0 time 10; printf "$1" >/dev/tty
+        \\  r=$(dd bs=256 count=1 2>/dev/null)$(dd bs=256 count=1 2>/dev/null)
+        \\  stty icanon echo; printf '%s' "$r" | tr -d '\033'; }
+        \\echo "alone=[$(ask '\033[6n\033]11;?\033\\')]"
+        \\read x
+        \\echo "attached=[$(ask '\033[6n\033]11;?\033\\\033[16t')]"
+        \\sleep 60
+    ;
+    try spawnDen(runtime, "asker", &.{ "/bin/sh", "-c", script }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/asker.sock", .{runtime});
+    defer gpa.free(sock);
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.send(.shutdown, &.{}) catch {};
+        while (true) _ = k.next() catch break;
+    } else |_| {};
+
+    // No client yet: den's default colors.
+    const alone = try waitHistory(sock, "alone=[");
+    defer gpa.free(alone);
+    try testing.expect(std.mem.indexOf(u8, alone, "[1;1R") != null);
+    try testing.expect(std.mem.indexOf(u8, alone, "]11;rgb:1d1d/1f1f/2121") != null);
+
+    // A client attaches and describes its terminal: bg #102030, 9x18 cells.
+    var conn = try Conn.open(sock);
+    defer conn.close();
+    try conn.send(.attach, &.{
+        &proto.le(u16, 80),                       &proto.le(u16, 24), &.{0b11},
+        &.{ 0xc0, 0xc0, 0xc0, 0x10, 0x20, 0x30 }, &proto.le(u16, 9),  &proto.le(u16, 18),
+    });
+    try conn.send(.input, &.{"go\r"});
+
+    // Everything this client is shown until the answer line is printed.
+    var shown: std.ArrayList(u8) = .empty;
+    defer shown.deinit(gpa);
+    while (true) {
+        const f = try conn.next();
+        if (f.type == .output) try shown.appendSlice(gpa, f.payload[8..]);
+        const at = std.mem.indexOf(u8, shown.items, "attached=[") orelse continue;
+        if (std.mem.indexOfScalarPos(u8, shown.items, at, '\n') != null) break;
+    }
+    try testing.expect(std.mem.indexOf(u8, shown.items, "]11;rgb:1010/2020/3030") != null);
+    try testing.expect(std.mem.indexOf(u8, shown.items, "[6;18;9t") != null);
+    try testing.expect(std.mem.indexOf(u8, shown.items, "R]11;") != null); // cursor answered
+    for ([_][]const u8{ "\x1b[6n", "\x1b]11;?", "\x1b[16t" }) |q|
+        try testing.expect(std.mem.indexOf(u8, shown.items, q) == null);
+}
+
+/// Poll history until it contains `needle`; caller frees.
+fn waitHistory(sock: []const u8, needle: []const u8) ![]u8 {
+    for (0..250) |_| {
+        const h = try history(sock);
+        if (std.mem.indexOf(u8, h, needle) != null) return h;
+        gpa.free(h);
+        sys.sleepMs(20);
+    }
+    return error.NeverAppeared;
+}

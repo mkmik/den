@@ -1,0 +1,11 @@
+{
+  "apiVersion": "den.mkm.pub/v1alpha1",
+  "kind": "Den",
+  "metadata": { "name": "example" },
+  "spec": {
+    "workingDir": "/tmp",
+    "env": [{ "name": "DEN_EXAMPLE", "value": "1" }],
+    "size": { "cols": 120, "rows": 40 },
+    "history": { "memoryLines": 5000, "keepAfterExit": "1h" }
+  }
+}
