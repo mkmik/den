@@ -27,8 +27,11 @@ pub fn setCloexec(fd: c.fd_t) void {
     _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
 }
 
-pub fn sleepMs(ms: i32) void {
-    _ = posix.poll(&.{}, ms) catch {};
+/// Not poll() with no fds: an empty slice has an undefined pointer, and
+/// Linux rejects that with EFAULT where macOS ignores it.
+pub fn sleepMs(ms: u32) void {
+    var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast(@as(u64, ms % 1000) * std.time.ns_per_ms) };
+    while (c.nanosleep(&ts, &ts) != 0 and c.errno(@as(c_int, -1)) == .INTR) {} // resume after a signal
 }
 
 /// In a forked child that failed before exec: say why on the PTY and exit.
