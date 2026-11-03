@@ -185,6 +185,8 @@ pub const Server = struct {
         const cwd = if (spec_.workingDir) |d| try a.dupeSentinel(u8, d, 0) else null;
         var env: std.ArrayList([2][*:0]const u8) = .empty;
         try env.append(a, .{ "TERM", "xterm-256color" });
+        // Tells the program, and any den run inside it, which den it is in.
+        try env.append(a, .{ "DEN_SOCKET", s.socket_path });
         for (spec_.env) |e| try env.append(a, .{ try a.dupeSentinel(u8, e.name, 0), try a.dupeSentinel(u8, e.value, 0) });
 
         var ws = s.winsize();

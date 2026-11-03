@@ -27,7 +27,8 @@ const help =
     \\commands:
     \\  spawn --spec FILE   start the Den resource (JSON) in FILE in the background
     \\  attach --spec FILE  show the program in this terminal and type into it;
-    \\                      Ctrl-\ detaches, the program keeps running
+    \\                      Ctrl-\ detaches, the program keeps running.
+    \\                      Refused inside a den (DEN_SOCKET is set)
     \\  status --spec FILE  print the resource with its status filled in
     \\                      (-o yaml, the default, or -o json)
     \\  history --spec FILE
@@ -46,7 +47,7 @@ const help =
     \\logging to <name>.log next to the socket. The socket is
     \\$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock, or
     \\$XDG_STATE_HOME/den/... (default ~/.local/state/den/...) without
-    \\XDG_RUNTIME_DIR.
+    \\XDG_RUNTIME_DIR. The program gets DEN_SOCKET set to that path.
     \\
 ;
 
@@ -285,6 +286,10 @@ fn detachKey(data: []const u8) ?usize {
 /// Show the program in this terminal and pass keys to it until Ctrl-\,
 /// the program exits, or den goes away.
 fn attach(gpa: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8) !void {
+    // Like tmux: an attach inside a den nests terminals, and Ctrl-\ only
+    // ever reaches the outer one, so the inner attach can never detach.
+    if (std.c.getenv("DEN_SOCKET")) |outer|
+        fatal("den: already inside the den at {s}; unset DEN_SOCKET to attach anyway\n", .{outer});
     if (std.c.isatty(0) == 0 or std.c.isatty(1) == 0) fatal("den: attach needs a terminal\n", .{});
     const fd = connect(den, socket_path);
     const orig = std.posix.tcgetattr(0) catch fail("den: reading terminal settings failed\n", .{});
