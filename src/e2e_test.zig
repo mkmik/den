@@ -442,6 +442,8 @@ test "attach types into the program and Ctrl-\\ detaches" {
     try readUntil(master, &seen, "got hello");
     _ = std.c.write(master, "\x1c", 1);
     try readUntil(master, &seen, "detached");
+    // Detach turns off modes such as size reports (2048, which vim uses).
+    try testing.expect(std.mem.indexOf(u8, seen.items, ";2048;") != null);
     var st: c_int = 0;
     _ = std.c.waitpid(pid, &st, 0);
     try testing.expectEqual(@as(c_int, 0), st);

@@ -367,7 +367,11 @@ fn attach(gpa: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8) !voi
 
     // Undo modes the program may have left on, so the shell works again.
     if (alternate) out("\x1b[?1049l");
-    out("\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[=0;1u\x1b7\x1b[r\x1b8");
+    // Modes that make the terminal send things unasked go first: mouse
+    // (9, 1000-1006, 1015, 1016), focus, paste, color scheme, visibility,
+    // size reports, kitty paste events. Otherwise they land in the shell.
+    out("\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016;2004;2031;2033;2048;5522l" ++
+        "\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[=0;1u\x1b7\x1b[r\x1b8");
     exitWith(0, "\r\n{s} ({s}/{s})\r\n", .{ why, den.metadata.namespace, den.metadata.name });
 }
 
@@ -480,9 +484,11 @@ fn exitWith(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
     _ = writeAll(2, msg);
-    // DRAIN: wait until the terminal has read everything. Closing a
-    // non-blocking terminal throws away output it has not read yet.
-    if (saved_termios) |t| std.posix.tcsetattr(0, .DRAIN, t) catch {};
+    // FLUSH waits until the terminal has read our output (closing a
+    // non-blocking terminal throws away what it has not read yet), then
+    // drops unread input: reports the program's modes asked for, which
+    // would otherwise show up at the shell prompt.
+    if (saved_termios) |t| std.posix.tcsetattr(0, .FLUSH, t) catch {};
     std.process.exit(code);
 }
 
