@@ -187,7 +187,7 @@ pub const Server = struct {
         try env.append(a, .{ "TERM", "xterm-256color" });
         for (spec_.env) |e| try env.append(a, .{ try a.dupeSentinel(u8, e.name, 0), try a.dupeSentinel(u8, e.value, 0) });
 
-        var ws: sys.winsize = .{ .row = s.size.rows, .col = s.size.cols };
+        var ws = s.winsize();
         var master: c_int = -1;
         const pid = sys.forkpty(&master, null, null, &ws);
         if (pid < 0) return error.ForkPtyFailed;
@@ -386,6 +386,7 @@ pub const Server = struct {
         s.cell_width = d.cell_width;
         s.cell_height = d.cell_height;
         if (!s.live) return;
+        if (s.master >= 0) sys.setWinsize(s.master, s.winsize());
         s.term.colors.foreground.default = .{ .r = d.fg[0], .g = d.fg[1], .b = d.fg[2] };
         s.term.colors.background.default = .{ .r = d.bg[0], .g = d.bg[1], .b = d.bg[2] };
     }
@@ -500,7 +501,18 @@ pub const Server = struct {
         if (std.meta.eql(want, s.size) or !s.live) return;
         s.size = want;
         try s.term.resize(s.gpa, .{ .cols = want.cols, .rows = want.rows });
-        if (s.master >= 0) sys.setWinsize(s.master, .{ .row = want.rows, .col = want.cols });
+        if (s.master >= 0) sys.setWinsize(s.master, s.winsize());
+    }
+
+    /// Pixel sizes too: programs that draw images (kitty graphics, sixel)
+    /// size them from TIOCGWINSZ.
+    fn winsize(s: *const Server) sys.winsize {
+        return .{
+            .row = s.size.rows,
+            .col = s.size.cols,
+            .xpixel = s.size.cols *| s.cell_width,
+            .ypixel = s.size.rows *| s.cell_height,
+        };
     }
 
     fn sendSnapshot(s: *Server, cl: *Client) !void {
