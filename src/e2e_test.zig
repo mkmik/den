@@ -433,6 +433,40 @@ test "typing makes a client's size win" {
 
 // `den attach` on a real terminal: it asks the terminal about itself, shows
 // the program, types into it, and Ctrl-\ detaches while the program runs on.
+// With two clients attached, the one that typed last sets the size.
+test "typing makes a client's size win" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-z{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    try spawnDen(runtime, "sz", &.{ "/bin/sh", "-c", "while read x; do echo \"$x $(stty size)\"; done" }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/sz.sock", .{runtime});
+    defer gpa.free(sock);
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.send(.shutdown, &.{}) catch {};
+        while (true) _ = k.next() catch break;
+    } else |_| {};
+
+    var a = try Conn.open(sock);
+    defer a.close();
+    try a.attach(80, 24);
+    var b = try Conn.open(sock);
+    defer b.close();
+    try b.attach(100, 30);
+    try testing.expectEqual(proto.Type.snapshot, (try b.next()).type); // b is attached
+    // b attached last, but a types, so a's size applies.
+    try a.send(.input, &.{"one\r"});
+
+    for (0..100) |_| {
+        const h = try history(sock);
+        defer gpa.free(h);
+        if (std.mem.indexOf(u8, h, "one 24 80") != null) break;
+        sys.sleepMs(20);
+    } else return error.SizeNotTaken;
+}
+
 test "attach types into the program and Ctrl-\\ detaches" {
     var dir_buf: [64]u8 = undefined;
     const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-a{d}", .{std.c.getpid()});
