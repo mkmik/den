@@ -77,7 +77,7 @@ pub fn resetSignals() void {
     posix.sigaction(.PIPE, &act, null);
 }
 
-pub const Got = struct { chld: bool = false, term: bool = false };
+pub const Got = struct { chld: bool = false, term: bool = false, winch: bool = false };
 
 pub fn drainSignalPipe() Got {
     var got: Got = .{};
@@ -87,7 +87,8 @@ pub fn drainSignalPipe() Got {
         if (n <= 0) return got;
         for (buf[0..@intCast(n)]) |b| switch (b) {
             @backingInt(c.SIG.CHLD) => got.chld = true,
-            @backingInt(c.SIG.TERM), @backingInt(c.SIG.INT) => got.term = true,
+            @backingInt(c.SIG.TERM), @backingInt(c.SIG.INT), @backingInt(c.SIG.HUP) => got.term = true,
+            @backingInt(c.SIG.WINCH) => got.winch = true,
             else => {},
         };
     }
