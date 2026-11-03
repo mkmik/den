@@ -39,8 +39,8 @@ const help =
     \\  help                show this help (also -h, --help)
     \\
     \\FILE is a path, absolute or relative, or a file:///absolute/path URL.
-    \\spawn prints the control socket path and goes into the background. The
-    \\socket is
+    \\spawn prints the control socket path and goes into the background,
+    \\logging to <name>.log next to the socket. The socket is
     \\$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock, or
     \\$XDG_STATE_HOME/den/... (default ~/.local/state/den/...) without
     \\XDG_RUNTIME_DIR.
@@ -120,11 +120,14 @@ pub fn main(init: std.process.Init) !void {
         fatal("den: creating {s}: {s}\n", .{ dir, @errorName(err) });
     const listen_fd = sys.listenUnix(socket_path) catch |err|
         fatal("den: listening on {s}: {s}\n", .{ socket_path, @errorName(err) });
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}.log", .{socket_path[0 .. socket_path.len - ".sock".len]}, 0);
+    const log_fd = std.c.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
+    if (log_fd < 0) fatal("den: opening {s}\n", .{log_path});
 
     out(try std.fmt.allocPrint(arena, "{s}\n", .{socket_path}));
 
     sys.ignoreSigpipe();
-    daemonize();
+    daemonize(log_fd);
 
     var server: Server = .{
         .gpa = gpa,
@@ -133,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
         .resource = resource,
         .socket_path = socket_path,
         .final_path = final_path,
+        .log_path = log_path,
         .listen_fd = listen_fd,
         .size = undefined,
     };
@@ -355,7 +359,8 @@ test socketPath {
 
 /// Fork twice so den is in its own session and can never acquire a
 /// controlling terminal; restarting whatever spawned den never kills it.
-fn daemonize() void {
+/// stdin becomes /dev/null, stdout and stderr go to `log_fd`.
+fn daemonize(log_fd: std.c.fd_t) void {
     switch (std.c.fork()) {
         -1 => fatal("den: fork failed\n", .{}),
         0 => {},
@@ -367,12 +372,14 @@ fn daemonize() void {
         0 => {},
         else => std.c._exit(0),
     }
-    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR });
+    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
     if (devnull >= 0) {
         _ = std.c.dup2(devnull, 0);
-        _ = std.c.dup2(devnull, 1);
         if (devnull > 2) _ = std.c.close(devnull);
     }
+    _ = std.c.dup2(log_fd, 1);
+    _ = std.c.dup2(log_fd, 2);
+    if (log_fd > 2) _ = std.c.close(log_fd);
 }
 
 test {

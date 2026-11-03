@@ -55,6 +55,8 @@ pub const Server = struct {
     socket_path: [:0]const u8,
     /// Where the final screen goes once the program has exited.
     final_path: [:0]const u8,
+    /// den's own stdout/stderr, next to the socket.
+    log_path: [:0]const u8,
     listen_fd: fd_t,
 
     /// The emulator; freed once the program has exited and its final state
@@ -564,6 +566,7 @@ pub const Server = struct {
             .pid = s.pid,
             .host = host,
             .socket = s.socket_path,
+            .log = s.log_path,
             .clients = clients,
             .screen = st.screen.?,
             .title = st.title.?,

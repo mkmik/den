@@ -43,6 +43,8 @@ pub const Status = struct {
     pid: i32,
     host: []const u8,
     socket: []const u8,
+    /// den's log file, next to the socket.
+    log: []const u8,
     /// Attached clients.
     clients: usize,
     /// main | alternate
@@ -94,10 +96,10 @@ test withStatus {
         \\{"kind":"Den","metadata":{"name":"x","labels":{"a":"b"}},"status":{"phase":"Old"}}
     , .{});
     defer v.deinit();
-    const json = try withStatus(gpa, v.value, .{ .phase = "Running", .pid = 7, .host = "h", .socket = "/s", .clients = 0, .screen = "main", .title = "", .cwd = "/" });
+    const json = try withStatus(gpa, v.value, .{ .phase = "Running", .pid = 7, .host = "h", .socket = "/s", .log = "/l", .clients = 0, .screen = "main", .title = "", .cwd = "/" });
     defer gpa.free(json);
     try std.testing.expectEqualStrings(
-        \\{"kind":"Den","metadata":{"name":"x","labels":{"a":"b"}},"status":{"phase":"Running","pid":7,"host":"h","socket":"/s","clients":0,"screen":"main","title":"","cwd":"/"}}
+        \\{"kind":"Den","metadata":{"name":"x","labels":{"a":"b"}},"status":{"phase":"Running","pid":7,"host":"h","socket":"/s","log":"/l","clients":0,"screen":"main","title":"","cwd":"/"}}
     , json);
 }
 
