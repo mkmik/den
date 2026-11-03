@@ -396,3 +396,78 @@ fn waitHistory(sock: []const u8, needle: []const u8) ![]u8 {
     }
     return error.NeverAppeared;
 }
+
+// `den attach` on a real terminal: it asks the terminal about itself, shows
+// the program, types into it, and Ctrl-\ detaches while the program runs on.
+test "attach types into the program and Ctrl-\\ detaches" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-a{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    try spawnDen(runtime, "att", &.{ "/bin/sh", "-c", "echo ready; read x; seq 1 20000; echo \"got $x\"; sleep 60" }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/att.sock", .{runtime});
+    defer gpa.free(sock);
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.send(.shutdown, &.{}) catch {};
+        while (true) _ = k.next() catch break;
+    } else |_| {};
+
+    const spec_path = try std.fmt.allocPrintSentinel(gpa, "{s}/att.json", .{runtime}, 0);
+    defer gpa.free(spec_path);
+    const state = try std.fmt.allocPrintSentinel(gpa, "{s}/state", .{runtime}, 0);
+    defer gpa.free(state);
+    const rt = try std.fmt.allocPrintSentinel(gpa, "{s}", .{runtime}, 0);
+    defer gpa.free(rt);
+    const bin = try std.fmt.allocPrintSentinel(gpa, "{s}", .{den_bin}, 0);
+    defer gpa.free(bin);
+    const argv = [_:null]?[*:0]const u8{ bin, "attach", "--spec", spec_path };
+
+    var master: c_int = undefined;
+    const pid = sys.forkpty(&master, null, null, &.{ .row = 24, .col = 80 });
+    if (pid < 0) return error.ForkptyFailed;
+    if (pid == 0) {
+        _ = sys.setenv("XDG_RUNTIME_DIR", rt, 1);
+        _ = sys.setenv("XDG_STATE_HOME", state, 1);
+        // Some shells leave the terminal non-blocking; attach must cope.
+        sys.setNonblock(1) catch {};
+        _ = sys.execvp(bin, &argv);
+        std.c._exit(127);
+    }
+    defer _ = std.c.close(master);
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+
+    // Be a terminal: answer DA1 and the background color query.
+    try readUntil(master, &seen, "\x1b[c");
+    _ = std.c.write(master, "\x1b]11;rgb:1010/2020/3030\x1b\\\x1b[?62c", 30);
+    try readUntil(master, &seen, "ready");
+    _ = std.c.write(master, "hello\r", 6);
+    sys.sleepMs(300); // let the output back up so writes to the terminal stall
+    try readUntil(master, &seen, "got hello");
+    _ = std.c.write(master, "\x1c", 1);
+    try readUntil(master, &seen, "detached");
+    // Detach turns off modes such as size reports (2048, which vim uses).
+    try testing.expect(std.mem.indexOf(u8, seen.items, ";2048;") != null);
+    var st: c_int = 0;
+    _ = std.c.waitpid(pid, &st, 0);
+    try testing.expectEqual(@as(c_int, 0), st);
+
+    // The program is still running and kept the line.
+    const h = try history(sock);
+    defer gpa.free(h);
+    try testing.expect(std.mem.indexOf(u8, h, "got hello") != null);
+}
+
+/// Read a PTY master into `seen` until it contains `needle`.
+fn readUntil(fd: std.c.fd_t, seen: *std.ArrayList(u8), needle: []const u8) !void {
+    while (std.mem.indexOf(u8, seen.items, needle) == null) {
+        var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&pfd, 5000) == 0) return error.Timeout;
+        var tmp: [4096]u8 = undefined;
+        const n = std.c.read(fd, &tmp, tmp.len);
+        if (n <= 0) return error.Closed;
+        try seen.appendSlice(gpa, tmp[0..@intCast(n)]);
+    }
+}

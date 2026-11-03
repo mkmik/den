@@ -2,6 +2,7 @@
 //!
 //!     den spawn --spec den.json
 //!     den status --spec den.json
+//!     den attach --spec den.json
 //!     den kill --spec den.json
 //!
 //! `spawn` loads the spec, opens the control socket, prints the socket path,
@@ -16,7 +17,7 @@ const proto = @import("proto.zig");
 const yaml = @import("yaml.zig");
 
 const version = @import("build_options").version;
-const usage = "usage: den spawn|status|history|send|kill --spec den.json [-o yaml|json] [--color] [-n] [TEXT...]\n";
+const usage = "usage: den spawn|attach|status|history|send|kill --spec den.json [-o yaml|json] [--color] [-n] [TEXT...]\n";
 const help =
     \\usage: den <command> [options]
     \\
@@ -25,6 +26,8 @@ const help =
     \\
     \\commands:
     \\  spawn --spec FILE   start the Den resource (JSON) in FILE in the background
+    \\  attach --spec FILE  show the program in this terminal and type into it;
+    \\                      Ctrl-\ detaches, the program keeps running
     \\  status --spec FILE  print the resource with its status filled in
     \\                      (-o yaml, the default, or -o json)
     \\  history --spec FILE
@@ -47,7 +50,7 @@ const help =
     \\
 ;
 
-const Command = enum { spawn, status, history, send, kill };
+const Command = enum { spawn, attach, status, history, send, kill };
 const Format = enum { yaml, json };
 
 pub fn main(init: std.process.Init) !void {
@@ -102,6 +105,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (cmd) {
         .spawn => {},
+        .attach => return attach(gpa, den, socket_path),
         .status => return status(arena, den, socket_path, format orelse .yaml),
         .history => return history(arena, den, socket_path, color),
         .send => {
@@ -267,6 +271,190 @@ fn readStdin(a: std.mem.Allocator) !std.ArrayList(u8) {
     }
 }
 
+/// The terminal settings before attach made it raw; exiting restores them.
+var saved_termios: ?std.posix.termios = null;
+
+/// Ctrl-\ detaches. A program that turned on the kitty keyboard protocol
+/// makes the terminal send it as CSI 92;5u instead of 0x1c.
+fn detachKey(data: []const u8) ?usize {
+    // ponytail: ignores kitty event-type variants (92;5:1u); add if a terminal sends them.
+    if (std.mem.indexOfScalar(u8, data, 0x1c)) |i| return i;
+    return std.mem.indexOf(u8, data, "\x1b[92;5u");
+}
+
+/// Show the program in this terminal and pass keys to it until Ctrl-\,
+/// the program exits, or den goes away.
+fn attach(gpa: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8) !void {
+    if (std.c.isatty(0) == 0 or std.c.isatty(1) == 0) fatal("den: attach needs a terminal\n", .{});
+    const fd = connect(den, socket_path);
+    const orig = std.posix.tcgetattr(0) catch fail("den: reading terminal settings failed\n", .{});
+    var raw = orig; // what cfmakeraw does
+    inline for (.{ "IGNBRK", "BRKINT", "PARMRK", "ISTRIP", "INLCR", "IGNCR", "ICRNL", "IXON" }) |f| @field(raw.iflag, f) = false;
+    raw.oflag.OPOST = false;
+    inline for (.{ "ECHO", "ECHONL", "ICANON", "ISIG", "IEXTEN" }) |f| @field(raw.lflag, f) = false;
+    raw.cflag.CSIZE = .CS8;
+    raw.cflag.PARENB = false;
+    raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+    raw.cc[@backingInt(std.posix.V.TIME)] = 0;
+    std.posix.tcsetattr(0, .FLUSH, raw) catch fail("den: setting terminal settings failed\n", .{});
+    saved_termios = orig;
+
+    try sys.openSignalPipe();
+    for ([_]std.c.SIG{ .WINCH, .TERM, .INT, .HUP }) |sig| sys.onSignal(sig);
+
+    var ws = winsize();
+    var hello: std.ArrayList(u8) = .empty;
+    defer hello.deinit(gpa);
+    try hello.appendSlice(gpa, &(proto.le(u16, ws.col) ++ proto.le(u16, ws.row)));
+    if (try queryColors(gpa)) |colors| {
+        try hello.append(gpa, 0b11);
+        try hello.appendSlice(gpa, &colors);
+        for ([_]u16{ ws.xpixel / @max(ws.col, 1), ws.ypixel / @max(ws.row, 1) }) |px| try hello.appendSlice(gpa, &proto.le(u16, px));
+    } else try hello.append(gpa, 0b01);
+    writeFrame(fd, socket_path, .attach, hello.items);
+
+    var alternate = false;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const why: []const u8 = loop: while (true) {
+        var pfd = [_]std.posix.pollfd{
+            .{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = sys.sig_pipe[0], .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        _ = try std.posix.poll(&pfd, -1);
+        var tmp: [64 * 1024]u8 = undefined;
+        if (pfd[2].revents != 0) {
+            const got = sys.drainSignalPipe();
+            if (got.term) break "den: detached";
+            if (got.winch) {
+                ws = winsize();
+                writeFrame(fd, socket_path, .resize, &(proto.le(u16, ws.col) ++ proto.le(u16, ws.row)));
+            }
+        }
+        if (pfd[0].revents != 0) {
+            const n = std.c.read(0, &tmp, tmp.len);
+            if (n == 0) break "den: detached";
+            if (n > 0) {
+                const data = tmp[0..@intCast(n)];
+                const cut = detachKey(data);
+                if (data[0 .. cut orelse data.len].len > 0) writeFrame(fd, socket_path, .input, data[0 .. cut orelse data.len]);
+                if (cut != null) {
+                    writeFrame(fd, socket_path, .detach, &.{});
+                    break "den: detached";
+                }
+            }
+        }
+        if (pfd[1].revents != 0) {
+            const n = std.c.read(fd, &tmp, tmp.len);
+            if (n <= 0) break "den: den went away";
+            try buf.appendSlice(gpa, tmp[0..@intCast(n)]);
+            var used: usize = 0;
+            while (proto.next(buf.items[used..], proto.max_den_frame) catch break :loop "den: bad frame from den") |r| {
+                const f, const len = r;
+                used += len;
+                switch (f.type) {
+                    .snapshot, .output => if (f.payload.len >= 8 and !writeAll(1, f.payload[8..])) break :loop "den: writing to the terminal failed",
+                    .event => {
+                        const ev = std.json.parseFromSlice(struct { screen: ?[]const u8 = null, phase: ?[]const u8 = null }, gpa, f.payload, .{ .ignore_unknown_fields = true }) catch continue;
+                        defer ev.deinit();
+                        if (ev.value.screen) |scr| alternate = std.mem.eql(u8, scr, "alternate");
+                        if (ev.value.phase) |p| if (std.mem.eql(u8, p, "Exited")) break :loop "den: the program has exited";
+                    },
+                    .detach => break :loop "den: den is shutting down",
+                    else => {},
+                }
+            }
+            buf.replaceRangeAssumeCapacity(0, used, &.{});
+        }
+    };
+
+    // Undo modes the program may have left on, so the shell works again.
+    if (alternate) out("\x1b[?1049l");
+    // Modes that make the terminal send things unasked go first: mouse
+    // (9, 1000-1006, 1015, 1016), focus, paste, color scheme, visibility,
+    // size reports, kitty paste events. Otherwise they land in the shell.
+    out("\x1b[?9;1000;1002;1003;1004;1005;1006;1015;1016;2004;2031;2033;2048;5522l" ++
+        "\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[=0;1u\x1b7\x1b[r\x1b8");
+    exitWith(0, "\r\n{s} ({s}/{s})\r\n", .{ why, den.metadata.namespace, den.metadata.name });
+}
+
+fn winsize() std.posix.winsize {
+    var ws: std.posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+    _ = std.c.ioctl(0, @bitCast(@as(u32, @intCast(std.c.T.IOCGWINSZ))), &ws);
+    if (ws.row == 0 or ws.col == 0) ws = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+    return ws;
+}
+
+/// Ask the terminal for its foreground and background colors, so den can
+/// answer programs that ask (vim picks its theme from the background).
+/// Every terminal answers DA1, and answers in order, so DA1 ends the wait
+/// whether or not the colors came back. Returns fg r,g,b then bg r,g,b.
+fn queryColors(gpa: std.mem.Allocator) !?[6]u8 {
+    out("\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    while (!endsDa1(buf.items)) {
+        var pfd = [_]std.posix.pollfd{.{ .fd = 0, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&pfd, 1000) == 0) break; // not a terminal that answers
+        var tmp: [256]u8 = undefined;
+        const n = std.c.read(0, &tmp, tmp.len);
+        if (n <= 0) break;
+        try buf.appendSlice(gpa, tmp[0..@intCast(n)]);
+    }
+    const fg = parseRgb(buf.items, "]10;rgb:") orelse return null;
+    const bg = parseRgb(buf.items, "]11;rgb:") orelse return null;
+    return fg ++ bg;
+}
+
+fn endsDa1(b: []const u8) bool {
+    const i = std.mem.indexOf(u8, b, "\x1b[?") orelse return false;
+    return std.mem.indexOfScalarPos(u8, b, i, 'c') != null;
+}
+
+/// "]11;rgb:1d1d/1f1f/2121" -> 1d 1f 21. Each part has 1 to 4 hex digits.
+fn parseRgb(b: []const u8, key: []const u8) ?[3]u8 {
+    const at = std.mem.indexOf(u8, b, key) orelse return null;
+    var it = std.mem.tokenizeAny(u8, b[at + key.len ..], "/\x07\x1b");
+    var rgb: [3]u8 = undefined;
+    for (&rgb) |*v| {
+        const hex = it.next() orelse return null;
+        if (hex.len == 0 or hex.len > 4) return null;
+        const x = std.fmt.parseInt(u32, hex, 16) catch return null;
+        const max = (@as(u32, 1) << @intCast(4 * hex.len)) - 1;
+        v.* = @intCast(x * 255 / max);
+    }
+    return rgb;
+}
+
+test parseRgb {
+    try std.testing.expectEqual([3]u8{ 0x1d, 0x1f, 0x21 }, parseRgb("\x1b]11;rgb:1d1d/1f1f/2121\x1b\\", "]11;rgb:").?);
+    try std.testing.expectEqual([3]u8{ 0xff, 0x00, 0x88 }, parseRgb("\x1b]10;rgb:ff/00/88\x07", "]10;rgb:").?);
+    try std.testing.expectEqual(@as(?[3]u8, null), parseRgb("\x1b[?62c", "]10;rgb:"));
+}
+
+/// Write all of `data`. The terminal may be non-blocking (the file is
+/// shared with the shell, and some shells leave it that way), and signals
+/// such as SIGWINCH interrupt writes, so both just mean "try again".
+fn writeAll(fd: std.c.fd_t, data: []const u8) bool {
+    var rest = data;
+    while (rest.len > 0) {
+        const n = std.c.write(fd, rest.ptr, rest.len);
+        if (n < 0) switch (std.c.errno(n)) {
+            .INTR => continue,
+            .AGAIN => {
+                var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+                _ = std.posix.poll(&pfd, -1) catch return false;
+                continue;
+            },
+            else => return false,
+        };
+        if (n == 0) return false;
+        rest = rest[@intCast(n)..];
+    }
+    return true;
+}
+
 /// Ask den to stop and wait until it has: den closes the connection last.
 fn kill(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8) !void {
     const fd = request(den, socket_path, .shutdown, &.{});
@@ -283,7 +471,7 @@ fn isHelp(arg: []const u8) bool {
 }
 
 fn out(msg: []const u8) void {
-    _ = std.c.write(1, msg.ptr, msg.len);
+    _ = writeAll(1, msg);
 }
 
 /// Bad usage or input: exit 2.
@@ -299,7 +487,12 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 fn exitWith(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
-    _ = std.c.write(2, msg.ptr, msg.len);
+    _ = writeAll(2, msg);
+    // FLUSH waits until the terminal has read our output (closing a
+    // non-blocking terminal throws away what it has not read yet), then
+    // drops unread input: reports the program's modes asked for, which
+    // would otherwise show up at the shell prompt.
+    if (saved_termios) |t| std.posix.tcsetattr(0, .FLUSH, t) catch {};
     std.process.exit(code);
 }
 

@@ -38,6 +38,7 @@ den reads a `Den` resource. For now it must be JSON (JSON is valid YAML):
 ```
 
     den spawn --spec den.json    # start it in the background
+    den attach --spec den.json   # use it in this terminal; Ctrl-\ detaches
     den status --spec den.json   # the resource with status filled in (-o yaml|json)
     den history --spec den.json  # scrollback and screen as text (--color keeps colors)
     den send --spec den.json make test   # type "make test" and Enter (-n: no Enter)
