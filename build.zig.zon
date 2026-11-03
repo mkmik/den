@@ -1,0 +1,13 @@
+.{
+    .name = .den,
+    .version = "0.0.0",
+    .fingerprint = 0x21f69537b0548fc,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .ghostty = .{
+            .url = "git+https://github.com/ghostty-org/ghostty#22f100c6367045bb5fc86172f837047dee2f7670",
+            .hash = "ghostty-1.3.2-dev-5UdBC57IhQX5QCxEHr_MlUcomZtBUMVoo9BwUBIAtkln",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
