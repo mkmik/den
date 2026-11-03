@@ -213,6 +213,12 @@ test "status and shutdown work without attaching" {
     try testing.expectEqual(0, status.get("clients").?.integer);
     try testing.expect(status.get("pid").?.integer > 0);
     try testing.expectEqualStrings(sock, status.get("socket").?.string);
+    const log_path = try std.fmt.allocPrint(gpa, "{s}/den/test/busy.log", .{runtime});
+    defer gpa.free(log_path);
+    try testing.expectEqualStrings(log_path, status.get("log").?.string);
+    const log_text = try std.Io.Dir.cwd().readFileAlloc(testing.io, log_path, gpa, .limited(1 << 20));
+    defer gpa.free(log_text);
+    try testing.expect(std.mem.indexOf(u8, log_text, "running pid=") != null);
 
     sys.sleepMs(1000); // awk is done, den is still working through its output
     var k = try Conn.open(sock);

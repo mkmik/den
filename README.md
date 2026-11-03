@@ -49,6 +49,8 @@ den prints its socket path and goes into the background. The socket is
 `$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock`. Where `XDG_RUNTIME_DIR` is not
 set (macOS) it is `$XDG_STATE_HOME/den/<namespace>/<name>.sock`, which is
 `~/.local/state/den/<namespace>/<name>.sock` by default.
+den logs to `<name>.log` next to the socket (also `status.log`); it keeps the
+file when it exits.
 den exits `keepAfterExit` after the program exits, or on `den kill` or SIGTERM
 (it sends the program SIGHUP, then SIGKILL after 5 seconds).
 
