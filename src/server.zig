@@ -455,6 +455,13 @@ pub const Server = struct {
             },
             // Watch-only clients cannot type; `den send` types without attaching.
             .input => if ((cl.rw or !cl.attached) and s.master >= 0) {
+                // Typing marks the client the user is at: its size wins. A
+                // focus-out report (mode 1004) is the user leaving, so not that.
+                if (cl.attached and cl.seq + 1 != s.next_seq and !std.mem.eql(u8, f.payload, "\x1b[O")) {
+                    cl.seq = s.next_seq;
+                    s.next_seq += 1;
+                    try s.applySize();
+                }
                 try s.pty_in.appendSlice(s.gpa, f.payload);
                 s.writePty();
             },
