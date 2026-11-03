@@ -44,5 +44,7 @@ jobs:
       - name: Build
         run: zig build --summary all
 
+      # A hung test fails with its name after a minute instead of eating
+      # the whole job timeout in silence.
       - name: Test (unit tests and end-to-end tests against the real binary)
-        run: zig build test --summary all
+        run: zig build test --summary all --test-timeout 60s
