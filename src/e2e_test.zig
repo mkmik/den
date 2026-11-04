@@ -505,3 +505,29 @@ fn readUntil(fd: std.c.fd_t, seen: *std.ArrayList(u8), needle: []const u8) !void
         try seen.appendSlice(gpa, tmp[0..@intCast(n)]);
     }
 }
+
+// The program sees DEN_SOCKET, so `den attach` run inside it refuses.
+test "attach inside a den refuses" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-n{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    const script = try std.fmt.allocPrint(gpa, "echo \"in $DEN_SOCKET\"; {s} attach --spec {s}/nest.json; echo \"exit $?\"; sleep 60", .{ den_bin, runtime });
+    defer gpa.free(script);
+    try spawnDen(runtime, "nest", &.{ "/bin/sh", "-c", script }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/nest.sock", .{runtime});
+    defer gpa.free(sock);
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.send(.shutdown, &.{}) catch {};
+        while (true) _ = k.next() catch break;
+    } else |_| {};
+
+    const h = try waitHistory(sock, "exit 2");
+    defer gpa.free(h);
+    const in = try std.fmt.allocPrint(gpa, "in {s}", .{sock});
+    defer gpa.free(in);
+    try testing.expect(std.mem.indexOf(u8, h, in) != null);
+    try testing.expect(std.mem.indexOf(u8, h, "already inside the den") != null);
+}
