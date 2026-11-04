@@ -1,11 +1,11 @@
 //! den: one background program, its PTY, and its full terminal history.
 //!
-//!     den spawn --spec den.yaml
-//!     den status --spec den.yaml
-//!     den attach --spec den.yaml
-//!     den kill --spec den.yaml
+//!     den apply -f den.yaml
+//!     den get -f den.yaml
+//!     den attach -f den.yaml
+//!     den delete -f den.yaml
 //!
-//! `spawn` loads the spec, opens the control socket, prints the socket path,
+//! `apply` loads the spec, opens the control socket, prints the socket path,
 //! and detaches into the background, where it runs the program until the
 //! program exits (plus history.keepAfterExit) or den gets SIGTERM.
 
@@ -17,7 +17,7 @@ const proto = @import("proto.zig");
 const yaml = @import("yaml.zig");
 
 const version = @import("build_options").version;
-const usage = "usage: den spawn|attach|status|history|send|kill --spec den.yaml [-o yaml|json] [--color] [-n] [TEXT...]\n";
+const usage = "usage: den apply|attach|get|logs|send|delete -f den.yaml [-o yaml|json] [--color] [-n] [TEXT...]\n";
 const help =
     \\usage: den <command> [options]
     \\
@@ -25,25 +25,26 @@ const help =
     \\screen and history, so clients can attach, detach and reattach.
     \\
     \\commands:
-    \\  spawn --spec FILE   start the Den resource (YAML or JSON) in FILE in the background
-    \\  attach --spec FILE  show the program in this terminal and type into it;
+    \\  apply -f FILE       start the Den resource (YAML or JSON) in FILE in the background
+    \\  attach -f FILE      show the program in this terminal and type into it;
     \\                      Ctrl-\ detaches, the program keeps running.
     \\                      Refused inside a den (DEN_SOCKET is set)
-    \\  status --spec FILE  print the resource with its status filled in
+    \\  get -f FILE         print the resource with its status filled in
     \\                      (-o yaml, the default, or -o json)
-    \\  history --spec FILE
+    \\  logs -f FILE
     \\                      print the scrollback and screen as text (--color
     \\                      keeps colors); the alternate screen comes last
-    \\  send --spec FILE [-n] [--] TEXT...
+    \\  send -f FILE [-n] [--] TEXT...
     \\                      type TEXT into the program, words joined by
     \\                      spaces, then Enter (-n: no Enter). Without TEXT,
     \\                      send stdin as is
-    \\  kill --spec FILE    stop the program (SIGHUP, SIGKILL after 5s) and den
+    \\  delete -f FILE      stop the program (SIGHUP, SIGKILL after 5s) and den
     \\  version             print the version (also --version)
     \\  help                show this help (also -h, --help)
     \\
-    \\FILE is a path, absolute or relative, or a file:///absolute/path URL.
-    \\spawn prints the control socket path and goes into the background,
+    \\FILE (-f, --filename) is a path, absolute or relative, or a
+    \\file:///absolute/path URL.
+    \\apply prints the control socket path and goes into the background,
     \\logging to <name>.log next to the socket. The socket is
     \\$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock, or
     \\$XDG_STATE_HOME/den/... (default ~/.local/state/den/...) without
@@ -51,7 +52,7 @@ const help =
     \\
 ;
 
-const Command = enum { spawn, attach, status, history, send, kill };
+const Command = enum { apply, attach, get, logs, send, delete };
 const Format = enum { yaml, json };
 
 pub fn main(init: std.process.Init) !void {
@@ -83,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
             enter = false;
         } else if (isHelp(arg)) {
             return out(help);
-        } else if (std.mem.eql(u8, arg, "--spec")) {
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--filename")) {
             spec_opt = args.next() orelse fatal(usage, .{});
         } else if (std.mem.eql(u8, arg, "--color")) {
             color = true;
@@ -93,9 +94,9 @@ pub fn main(init: std.process.Init) !void {
         } else fatal("den: unknown argument {s}\n" ++ usage, .{arg});
     }
     const spec_arg = spec_opt orelse fatal(usage, .{});
-    if (format != null and cmd != .status) fatal("den: -o only applies to status\n", .{});
-    if (color and cmd != .history) fatal("den: --color only applies to history\n", .{});
-    const path = specPath(spec_arg) orelse fatal("den: --spec must be a file path or file:///absolute/path URL: {s}\n", .{spec_arg});
+    if (format != null and cmd != .get) fatal("den: -o only applies to get\n", .{});
+    if (color and cmd != .logs) fatal("den: --color only applies to logs\n", .{});
+    const path = specPath(spec_arg) orelse fatal("den: -f must be a file path or file:///absolute/path URL: {s}\n", .{spec_arg});
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
         fatal("den: reading {s}: {s}\n", .{ path, @errorName(err) });
@@ -106,16 +107,16 @@ pub fn main(init: std.process.Init) !void {
     const socket_path = try socketPath(arena, init.environ_map, den.metadata.namespace, den.metadata.name);
 
     switch (cmd) {
-        .spawn => {},
+        .apply => {},
         .attach => return attach(gpa, den, socket_path),
-        .status => return status(arena, den, socket_path, format orelse .yaml),
-        .history => return history(arena, den, socket_path, color),
+        .get => return get(arena, den, socket_path, format orelse .yaml),
+        .logs => return logs(arena, den, socket_path, color),
         .send => {
             var data = text orelse try readStdin(arena);
             if (text != null and enter) try data.append(arena, '\r');
             return send(arena, den, socket_path, data.items);
         },
-        .kill => return kill(arena, den, socket_path),
+        .delete => return delete(arena, den, socket_path),
     }
 
     _ = spec.parseDuration(den.spec.history.keepAfterExit) catch
@@ -212,11 +213,11 @@ fn reply(a: std.mem.Allocator, fd: std.c.fd_t, socket_path: []const u8, want: pr
     };
     if (f) |frame| if (frame.type == want) return frame;
     fail("den: no {s} reply from {s}; that den is probably older than this binary.\n" ++
-        "Restart it: den kill --spec FILE, then den spawn --spec FILE\n", .{ @tagName(want), socket_path });
+        "Restart it: den delete -f FILE, then den apply -f FILE\n", .{ @tagName(want), socket_path });
 }
 
 /// Print the resource den runs, with its status, as YAML or JSON.
-fn status(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, format: Format) !void {
+fn get(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, format: Format) !void {
     const fd = request(den, socket_path, .status, &.{});
     const f = try reply(a, fd, socket_path, .status);
     const resource = try std.json.parseFromSliceLeaky(std.json.Value, a, f.payload, .{});
@@ -232,7 +233,7 @@ fn status(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, format
 }
 
 /// Print the scrollback and screen as text.
-fn history(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, color: bool) !void {
+fn logs(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, color: bool) !void {
     const fd = request(den, socket_path, .history, &.{@intFromBool(color)});
     const f = try reply(a, fd, socket_path, .history);
     var rest = f.payload;
@@ -462,7 +463,7 @@ fn writeAll(fd: std.c.fd_t, data: []const u8) bool {
 }
 
 /// Ask den to stop and wait until it has: den closes the connection last.
-fn kill(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8) !void {
+fn delete(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8) !void {
     const fd = request(den, socket_path, .shutdown, &.{});
     var buf: std.ArrayList(u8) = .empty;
     // den gives the program 5 s before SIGKILL; allow for that and more.
@@ -491,7 +492,7 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 fn exitWith(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
-    var buf: [1024]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
     _ = writeAll(2, msg);
     // FLUSH waits until the terminal has read our output (closing a
@@ -557,7 +558,7 @@ test socketPath {
 }
 
 /// Fork twice so den is in its own session and can never acquire a
-/// controlling terminal; restarting whatever spawned den never kills it.
+/// controlling terminal; restarting whatever started den never kills it.
 /// stdin becomes /dev/null, stdout and stderr go to `log_fd`.
 fn daemonize(log_fd: std.c.fd_t) void {
     switch (std.c.fork()) {

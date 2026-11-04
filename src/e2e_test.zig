@@ -96,14 +96,14 @@ fn spawnDen(runtime: []const u8, name: []const u8, command: []const []const u8, 
     defer gpa.free(state);
     try env.put("XDG_STATE_HOME", state);
     var child = try std.process.spawn(testing.io, .{
-        .argv = &.{ den_bin, "spawn", "--spec", spec_url },
+        .argv = &.{ den_bin, "apply", "-f", spec_url },
         .environ_map = &env,
         .stdout = .ignore,
     });
     try testing.expect((try child.wait(testing.io)).success());
 }
 
-/// `den history` over the socket: plain text, caller frees.
+/// `den logs` over the socket: plain text, caller frees.
 fn history(sock: []const u8) ![]u8 {
     var h = try Conn.open(sock);
     defer h.close();
@@ -456,7 +456,7 @@ test "attach types into the program and Ctrl-\\ detaches" {
     defer gpa.free(rt);
     const bin = try std.fmt.allocPrintSentinel(gpa, "{s}", .{den_bin}, 0);
     defer gpa.free(bin);
-    const argv = [_:null]?[*:0]const u8{ bin, "attach", "--spec", spec_path };
+    const argv = [_:null]?[*:0]const u8{ bin, "attach", "-f", spec_path };
 
     var master: c_int = undefined;
     const pid = sys.forkpty(&master, null, null, &.{ .row = 24, .col = 80 });
@@ -512,7 +512,7 @@ test "attach inside a den refuses" {
     const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-n{d}", .{std.c.getpid()});
     try sys.mkdirAll(runtime);
     defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
-    const script = try std.fmt.allocPrint(gpa, "echo \"in $DEN_SOCKET\"; {s} attach --spec {s}/nest.json; echo \"exit $?\"; sleep 60", .{ den_bin, runtime });
+    const script = try std.fmt.allocPrint(gpa, "echo \"in $DEN_SOCKET\"; {s} attach -f {s}/nest.json; echo \"exit $?\"; sleep 60", .{ den_bin, runtime });
     defer gpa.free(script);
     try spawnDen(runtime, "nest", &.{ "/bin/sh", "-c", script }, "0s");
     const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/nest.sock", .{runtime});
