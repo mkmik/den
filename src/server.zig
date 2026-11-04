@@ -122,7 +122,7 @@ pub const Server = struct {
         while (try s.tick()) {}
 
         // Clean up before hanging up on clients, so a client that sees den
-        // close (den kill) can count on den and its files being gone.
+        // close (den delete) can count on den and its files being gone.
         _ = c.unlink(s.socket_path);
         _ = c.close(s.listen_fd);
         if (!s.live) _ = c.unlink(s.final_path);

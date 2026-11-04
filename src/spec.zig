@@ -22,7 +22,7 @@ pub const Spec = struct {
     workingDir: ?[]const u8 = null,
     /// Added to the environment; wins over inherited or login values.
     env: []const EnvVar = &.{},
-    /// Variables copied from den's own environment (the one `den spawn` ran
+    /// Variables copied from den's own environment (the one `den apply` ran
     /// with) on top of a fresh login environment (HOME, USER, LOGNAME,
     /// SHELL, a minimal PATH). Exact names, or prefixes ending in `*`:
     /// ["LANG", "LC_*"]; ["*"] copies everything.
@@ -40,7 +40,7 @@ pub const History = struct {
     keepAfterExit: []const u8 = "24h",
 };
 
-/// What den reports about itself: the resource's `status`. `den status`
+/// What den reports about itself: the resource's `status`. `den get`
 /// prints it and milestone 4 PATCHes the same thing to the backend.
 pub const Status = struct {
     /// Running | Exited (Pending and Failed come with the backend).

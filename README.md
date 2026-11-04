@@ -16,7 +16,7 @@ Needs Zig 0.17.
     zig build test     # unit tests plus an end-to-end test of the real binary
 
 Or use `just` (run `just` to list recipes): `just build`, `just test`,
-`just release`, `just linux aarch64`, `just run spawn --spec examples/den.yaml`.
+`just release`, `just linux aarch64`, `just run apply -f examples/den.yaml`.
 
 ## Run
 
@@ -47,23 +47,23 @@ The YAML reader covers what people write by hand: block mappings and
 lists, quoted and plain scalars, and comments. Inline `[...]` and `{...}`
 must be valid JSON; anchors, tags and `|`/`>` block text are not supported.
 
-    den spawn --spec den.yaml    # start it in the background
-    den attach --spec den.yaml   # use it in this terminal; Ctrl-\ detaches
-    den status --spec den.yaml   # the resource with status filled in (-o yaml|json)
-    den history --spec den.yaml  # scrollback and screen as text (--color keeps colors)
-    den send --spec den.yaml make test   # type "make test" and Enter (-n: no Enter)
-    den kill --spec den.yaml     # stop the program and den
+    den apply -f den.yaml      # start it in the background
+    den attach -f den.yaml     # use it in this terminal; Ctrl-\ detaches
+    den get -f den.yaml        # the resource with status filled in (-o yaml|json)
+    den logs -f den.yaml       # scrollback and screen as text (--color keeps colors)
+    den send -f den.yaml make test   # type "make test" and Enter (-n: no Enter)
+    den delete -f den.yaml     # stop the program and den
 
 Without `command`, den runs your login shell (from the password database) as
 a login shell. The program starts from a fresh login environment: `HOME`,
 `USER`, `LOGNAME`, `SHELL` and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. On top of
 that come the variables named in `inheritEnv`, copied from the environment
-`den spawn` ran with (exact names, or prefixes ending in `*`, e.g.
+`den apply` ran with (exact names, or prefixes ending in `*`, e.g.
 `["LANG", "LC_*", "SSH_AUTH_SOCK", "TMPDIR"]`; `["*"]` copies everything), then
 `TERM=xterm-256color` and `DEN_SOCKET`, then `env`. den passes nothing through on its own:
 which variables to inherit is up to whatever writes the spec.
 
-`--spec` takes a path, absolute or relative, or a `file:///absolute/path` URL.
+`-f` (`--filename`) takes a path, absolute or relative, or a `file:///absolute/path` URL.
 
 den prints its socket path and goes into the background. The socket is
 `$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock`. Where `XDG_RUNTIME_DIR` is not
@@ -71,7 +71,7 @@ set (macOS) it is `$XDG_STATE_HOME/den/<namespace>/<name>.sock`, which is
 `~/.local/state/den/<namespace>/<name>.sock` by default.
 den logs to `<name>.log` next to the socket (also `status.log`); it keeps the
 file when it exits.
-den exits `keepAfterExit` after the program exits, or on `den kill` or SIGTERM
+den exits `keepAfterExit` after the program exits, or on `den delete` or SIGTERM
 (it sends the program SIGHUP, then SIGKILL after 5 seconds).
 
 Once the program has exited its screen cannot change, so den writes the final
