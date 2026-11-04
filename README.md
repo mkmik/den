@@ -31,6 +31,7 @@ den reads a `Den` resource. For now it must be JSON (JSON is valid YAML):
     "command": ["/bin/zsh", "-l"],
     "workingDir": "/home/marko/src/myproject",
     "env": [{ "name": "FOO", "value": "bar" }],
+    "inheritEnv": ["LANG", "LC_*", "SSH_AUTH_SOCK", "TMPDIR"],
     "size": { "cols": 120, "rows": 40 },
     "history": { "memoryLines": 5000, "keepAfterExit": "24h" }
   }
@@ -43,6 +44,15 @@ den reads a `Den` resource. For now it must be JSON (JSON is valid YAML):
     den history --spec den.json  # scrollback and screen as text (--color keeps colors)
     den send --spec den.json make test   # type "make test" and Enter (-n: no Enter)
     den kill --spec den.json     # stop the program and den
+
+Without `command`, den runs your login shell (from the password database) as
+a login shell. The program starts from a fresh login environment: `HOME`,
+`USER`, `LOGNAME`, `SHELL` and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. On top of
+that come the variables named in `inheritEnv`, copied from the environment
+`den spawn` ran with (exact names, or prefixes ending in `*`, e.g.
+`["LANG", "LC_*", "SSH_AUTH_SOCK", "TMPDIR"]`; `["*"]` copies everything), then
+`TERM=xterm-256color` and `DEN_SOCKET`, then `env`. den passes nothing through on its own:
+which variables to inherit is up to whatever writes the spec.
 
 `--spec` takes a path, absolute or relative, or a `file:///absolute/path` URL.
 

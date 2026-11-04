@@ -17,10 +17,16 @@ pub const Metadata = struct {
 };
 
 pub const Spec = struct {
-    /// Empty means $SHELL (or /bin/sh).
+    /// Empty means the user's shell as a login shell.
     command: []const []const u8 = &.{},
     workingDir: ?[]const u8 = null,
+    /// Added to the environment; wins over inherited or login values.
     env: []const EnvVar = &.{},
+    /// Variables copied from den's own environment (the one `den spawn` ran
+    /// with) on top of a fresh login environment (HOME, USER, LOGNAME,
+    /// SHELL, a minimal PATH). Exact names, or prefixes ending in `*`:
+    /// ["LANG", "LC_*"]; ["*"] copies everything.
+    inheritEnv: []const []const u8 = &.{},
     /// Used while no read-write client is attached.
     size: Size = .{},
     paused: bool = false,
@@ -144,7 +150,7 @@ test parse {
     const den = try parse(arena.allocator(),
         \\{"apiVersion":"den.mkm.pub/v1alpha1","kind":"Den",
         \\ "metadata":{"name":"build","namespace":"myproject","uid":"x"},
-        \\ "spec":{"command":["/bin/zsh","-l"],"env":[{"name":"FOO","value":"bar"}],
+        \\ "spec":{"command":["/bin/zsh","-l"],"env":[{"name":"FOO","value":"bar"}],"inheritEnv":["LC_*"],
         \\         "size":{"cols":120,"rows":40},"history":{"keepAfterExit":"1h"},
         \\         "report":{"interval":"5s"}},
         \\ "status":{"phase":"Running"}}
@@ -152,6 +158,7 @@ test parse {
     try std.testing.expectEqualStrings("myproject", den.metadata.namespace);
     try std.testing.expectEqual(@as(u16, 120), den.spec.size.cols);
     try std.testing.expectEqualStrings("bar", den.spec.env[0].value);
+    try std.testing.expectEqualStrings("LC_*", den.spec.inheritEnv[0]);
     try std.testing.expectEqual(@as(u32, 5000), den.spec.history.memoryLines);
 }
 
