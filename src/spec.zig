@@ -109,10 +109,9 @@ test withStatus {
     , json);
 }
 
-/// Parse a Den from JSON. JSON is valid YAML, so a JSON den.yaml works too.
-/// ponytail: JSON only; add a YAML subset parser when hand-written YAML specs matter.
-pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Den {
-    const den = try std.json.parseFromSliceLeaky(Den, arena, bytes, .{ .ignore_unknown_fields = true });
+/// Read a Den from the resource as parsed by yaml.parse (JSON or YAML).
+pub fn parse(arena: std.mem.Allocator, resource: std.json.Value) !Den {
+    const den = try std.json.parseFromValueLeaky(Den, arena, resource, .{ .ignore_unknown_fields = true });
     if (den.metadata.name.len == 0) return error.MissingName;
     if (!std.mem.eql(u8, den.kind, "Den")) return error.WrongKind;
     if (den.spec.size.cols == 0 or den.spec.size.rows == 0) return error.InvalidSize;
@@ -147,14 +146,14 @@ pub fn parseDuration(s: []const u8) !u64 {
 test parse {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const den = try parse(arena.allocator(),
+    const den = try parse(arena.allocator(), try @import("yaml.zig").parse(arena.allocator(),
         \\{"apiVersion":"den.mkm.pub/v1alpha1","kind":"Den",
         \\ "metadata":{"name":"build","namespace":"myproject","uid":"x"},
         \\ "spec":{"command":["/bin/zsh","-l"],"env":[{"name":"FOO","value":"bar"}],"inheritEnv":["LC_*"],
         \\         "size":{"cols":120,"rows":40},"history":{"keepAfterExit":"1h"},
         \\         "report":{"interval":"5s"}},
         \\ "status":{"phase":"Running"}}
-    );
+    ));
     try std.testing.expectEqualStrings("myproject", den.metadata.namespace);
     try std.testing.expectEqual(@as(u16, 120), den.spec.size.cols);
     try std.testing.expectEqualStrings("bar", den.spec.env[0].value);

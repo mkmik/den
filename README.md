@@ -16,34 +16,43 @@ Needs Zig 0.17.
     zig build test     # unit tests plus an end-to-end test of the real binary
 
 Or use `just` (run `just` to list recipes): `just build`, `just test`,
-`just release`, `just linux aarch64`, `just run spawn --spec examples/den.json`.
+`just release`, `just linux aarch64`, `just run spawn --spec examples/den.yaml`.
 
 ## Run
 
-den reads a `Den` resource. For now it must be JSON (JSON is valid YAML):
+den reads a `Den` resource, as YAML or JSON:
 
-```json
-{
-  "apiVersion": "den.mkm.pub/v1alpha1",
-  "kind": "Den",
-  "metadata": { "name": "build", "namespace": "myproject" },
-  "spec": {
-    "command": ["/bin/zsh", "-l"],
-    "workingDir": "/home/marko/src/myproject",
-    "env": [{ "name": "FOO", "value": "bar" }],
-    "inheritEnv": ["LANG", "LC_*", "SSH_AUTH_SOCK", "TMPDIR"],
-    "size": { "cols": 120, "rows": 40 },
-    "history": { "memoryLines": 5000, "keepAfterExit": "24h" }
-  }
-}
+```yaml
+apiVersion: den.mkm.pub/v1alpha1
+kind: Den
+metadata:
+  name: build
+  namespace: myproject
+spec:
+  command: ["/bin/zsh", "-l"]
+  workingDir: /home/marko/src/myproject
+  env:
+  - name: FOO
+    value: bar
+  inheritEnv: ["LANG", "LC_*", "SSH_AUTH_SOCK", "TMPDIR"]
+  size:
+    cols: 120
+    rows: 40
+  history:
+    memoryLines: 5000
+    keepAfterExit: 24h
 ```
 
-    den spawn --spec den.json    # start it in the background
-    den attach --spec den.json   # use it in this terminal; Ctrl-\ detaches
-    den status --spec den.json   # the resource with status filled in (-o yaml|json)
-    den history --spec den.json  # scrollback and screen as text (--color keeps colors)
-    den send --spec den.json make test   # type "make test" and Enter (-n: no Enter)
-    den kill --spec den.json     # stop the program and den
+The YAML reader covers what people write by hand: block mappings and
+lists, quoted and plain scalars, and comments. Inline `[...]` and `{...}`
+must be valid JSON; anchors, tags and `|`/`>` block text are not supported.
+
+    den spawn --spec den.yaml    # start it in the background
+    den attach --spec den.yaml   # use it in this terminal; Ctrl-\ detaches
+    den status --spec den.yaml   # the resource with status filled in (-o yaml|json)
+    den history --spec den.yaml  # scrollback and screen as text (--color keeps colors)
+    den send --spec den.yaml make test   # type "make test" and Enter (-n: no Enter)
+    den kill --spec den.yaml     # stop the program and den
 
 Without `command`, den runs your login shell (from the password database) as
 a login shell. The program starts from a fresh login environment: `HOME`,
