@@ -15,9 +15,10 @@ const sys = @import("sys.zig");
 const Server = @import("server.zig").Server;
 const proto = @import("proto.zig");
 const yaml = @import("yaml.zig");
+const fetch = @import("fetch.zig");
 
 const version = @import("build_options").version;
-const usage = "usage: den apply|attach|get|logs|send|delete -f den.yaml [-o yaml|json] [--color] [-n] [TEXT...]\n";
+const usage = "usage: den apply|attach|get|logs|send|delete -f den.yaml [--unix-socket PATH] [-o yaml|json] [--color] [-n] [TEXT...]\n";
 const help =
     \\usage: den <command> [options]
     \\
@@ -42,8 +43,13 @@ const help =
     \\  version             print the version (also --version)
     \\  help                show this help (also -h, --help)
     \\
-    \\FILE (-f, --filename) is a path, absolute or relative, or a
-    \\file:///absolute/path URL.
+    \\FILE (-f, --filename) is a path, absolute or relative, or a URL:
+    \\file:///absolute/path, http://..., https://..., or
+    \\http+unix://%2Fpath%2Fto.sock/url/path for HTTP over the Unix
+    \\socket /path/to.sock. It must answer 2xx; den reads at most 1 MiB.
+    \\--unix-socket PATH  fetch the http:// URL in FILE over the Unix socket
+    \\                    PATH, like curl; the URL's host is only the Host
+    \\                    header
     \\apply prints the control socket path and goes into the background,
     \\logging to <name>.log next to the socket. The socket is
     \\$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock, or
@@ -68,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
     const cmd = std.meta.stringToEnum(Command, arg0) orelse fatal("den: unknown command {s}\n" ++ help, .{arg0});
 
     var spec_opt: ?[]const u8 = null;
+    var unix_socket: ?[]const u8 = null;
     var format: ?Format = null;
     var color = false;
     var enter = true;
@@ -86,6 +93,8 @@ pub fn main(init: std.process.Init) !void {
             return out(help);
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--filename")) {
             spec_opt = args.next() orelse fatal(usage, .{});
+        } else if (std.mem.eql(u8, arg, "--unix-socket")) {
+            unix_socket = args.next() orelse fatal(usage, .{});
         } else if (std.mem.eql(u8, arg, "--color")) {
             color = true;
         } else if (std.mem.eql(u8, arg, "-o")) {
@@ -93,13 +102,17 @@ pub fn main(init: std.process.Init) !void {
             format = std.meta.stringToEnum(Format, f) orelse fatal("den: -o must be yaml or json, not {s}\n", .{f});
         } else fatal("den: unknown argument {s}\n" ++ usage, .{arg});
     }
-    const spec_arg = spec_opt orelse fatal(usage, .{});
+    const path = spec_opt orelse fatal(usage, .{});
     if (format != null and cmd != .get) fatal("den: -o only applies to get\n", .{});
     if (color and cmd != .logs) fatal("den: --color only applies to logs\n", .{});
-    const path = specPath(spec_arg) orelse fatal("den: -f must be a file path or file:///absolute/path URL: {s}\n", .{spec_arg});
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
-        fatal("den: reading {s}: {s}\n", .{ path, @errorName(err) });
+    var status: std.http.Status = .ok;
+    const bytes = fetch.read(gpa, arena, io, path, unix_socket, &status) catch |err| switch (err) {
+        error.HttpStatus => fatal("den: reading {s}: HTTP {d} {s}\n", .{ path, @backingInt(status), status.phrase() orelse "" }),
+        error.UnixSocketNeedsHttp => fatal("den: --unix-socket needs an http:// URL: {s}\n", .{path}),
+        error.UnsupportedUrl => fatal("den: -f must be a path or a file:, http:, https: or http+unix: URL: {s}\n", .{path}),
+        else => fatal("den: reading {s}: {s}\n", .{ path, @errorName(err) }),
+    };
     const resource = yaml.parse(arena, bytes) catch |err|
         fatal("den: parsing {s}: {s}\n", .{ path, @errorName(err) });
     const den = spec.parse(arena, resource) catch |err|
@@ -503,18 +516,6 @@ fn exitWith(code: u8, comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(code);
 }
 
-/// "file:///a/b" -> "/a/b"; a plain path, absolute or relative, as is.
-/// Other URLs (http:// comes in milestone 4) are not supported yet.
-fn specPath(arg: []const u8) ?[]const u8 {
-    const prefix = "file://";
-    if (std.mem.startsWith(u8, arg, prefix)) {
-        const p = arg[prefix.len..];
-        return if (p.len > 0 and p[0] == '/') p else null;
-    }
-    if (arg.len == 0 or std.mem.indexOf(u8, arg, "://") != null) return null;
-    return arg;
-}
-
 /// $XDG_STATE_HOME/den/<namespace>, or $HOME/.local/state/den/<namespace>:
 /// per-user files on disk, such as the final screen of an exited program.
 fn stateDir(a: std.mem.Allocator, env: *const std.process.Environ.Map, ns: []const u8) ![]const u8 {
@@ -587,17 +588,8 @@ test {
     _ = @import("spec.zig");
     _ = @import("proto.zig");
     _ = @import("yaml.zig");
+    _ = @import("fetch.zig");
     _ = @import("queries.zig");
     _ = @import("server.zig");
     _ = @import("e2e_test.zig");
-}
-
-test specPath {
-    try std.testing.expectEqualStrings("/a/b.json", specPath("file:///a/b.json").?);
-    try std.testing.expectEqualStrings("/a/b.json", specPath("/a/b.json").?);
-    try std.testing.expectEqualStrings("den.json", specPath("den.json").?);
-    try std.testing.expectEqualStrings("../x/den.json", specPath("../x/den.json").?);
-    try std.testing.expectEqual(@as(?[]const u8, null), specPath("http://x/y"));
-    try std.testing.expectEqual(@as(?[]const u8, null), specPath("file://relative"));
-    try std.testing.expectEqual(@as(?[]const u8, null), specPath(""));
 }

@@ -63,7 +63,21 @@ that come the variables named in `inheritEnv`, copied from the environment
 `TERM=xterm-256color` and `DEN_SOCKET`, then `env`. den passes nothing through on its own:
 which variables to inherit is up to whatever writes the spec.
 
-`-f` (`--filename`) takes a path, absolute or relative, or a `file:///absolute/path` URL.
+`-f` (`--filename`) takes a path, absolute or relative, or a URL:
+
+    den apply -f den.yaml
+    den apply -f file:///home/marko/den.yaml
+    den apply -f https://example.com/dens/build.yaml
+    den apply -f http+unix://%2Frun%2Fapi.sock/v1/dens/build
+    den apply -f http://api/v1/dens/build --unix-socket /run/api.sock
+
+The last two both ask the HTTP server on the Unix socket `/run/api.sock` for
+`/v1/dens/build`. In `http+unix://` the host is the socket path with each `/`
+written as `%2F` (the same form as Python's requests-unixsocket and HTTPie);
+the Host header is `localhost`. `--unix-socket` works like curl's: the URL
+must be `http://`, and its host only goes in the Host header.
+Whatever comes back is read as if it came from a file. The server must answer 2xx; den reads at most 1 MiB
+and follows redirects only over TCP.
 
 den prints its socket path and goes into the background. The socket is
 `$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock`. Where `XDG_RUNTIME_DIR` is not
