@@ -1,9 +1,9 @@
 //! den: one background program, its PTY, and its full terminal history.
 //!
-//!     den spawn --spec den.json
-//!     den status --spec den.json
-//!     den attach --spec den.json
-//!     den kill --spec den.json
+//!     den spawn --spec den.yaml
+//!     den status --spec den.yaml
+//!     den attach --spec den.yaml
+//!     den kill --spec den.yaml
 //!
 //! `spawn` loads the spec, opens the control socket, prints the socket path,
 //! and detaches into the background, where it runs the program until the
@@ -17,7 +17,7 @@ const proto = @import("proto.zig");
 const yaml = @import("yaml.zig");
 
 const version = @import("build_options").version;
-const usage = "usage: den spawn|attach|status|history|send|kill --spec den.json [-o yaml|json] [--color] [-n] [TEXT...]\n";
+const usage = "usage: den spawn|attach|status|history|send|kill --spec den.yaml [-o yaml|json] [--color] [-n] [TEXT...]\n";
 const help =
     \\usage: den <command> [options]
     \\
@@ -25,7 +25,7 @@ const help =
     \\screen and history, so clients can attach, detach and reattach.
     \\
     \\commands:
-    \\  spawn --spec FILE   start the Den resource (JSON) in FILE in the background
+    \\  spawn --spec FILE   start the Den resource (YAML or JSON) in FILE in the background
     \\  attach --spec FILE  show the program in this terminal and type into it;
     \\                      Ctrl-\ detaches, the program keeps running.
     \\                      Refused inside a den (DEN_SOCKET is set)
@@ -99,9 +99,10 @@ pub fn main(init: std.process.Init) !void {
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch |err|
         fatal("den: reading {s}: {s}\n", .{ path, @errorName(err) });
-    const den = spec.parse(arena, bytes) catch |err|
+    const resource = yaml.parse(arena, bytes) catch |err|
         fatal("den: parsing {s}: {s}\n", .{ path, @errorName(err) });
-    const resource = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
+    const den = spec.parse(arena, resource) catch |err|
+        fatal("den: parsing {s}: {s}\n", .{ path, @errorName(err) });
     const socket_path = try socketPath(arena, init.environ_map, den.metadata.namespace, den.metadata.name);
 
     switch (cmd) {

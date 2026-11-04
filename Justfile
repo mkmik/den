@@ -22,7 +22,7 @@ linux arch="x86_64":
 fmt:
     zig fmt src build.zig build.zig.zon
 
-# Build, then run den with any arguments, e.g. just run spawn --spec den.json
+# Build, then run den with any arguments, e.g. just run spawn --spec den.yaml
 [positional-arguments]
 run *args: build
     ./zig-out/bin/den "$@"
