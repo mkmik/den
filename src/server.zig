@@ -59,6 +59,8 @@ const Pusher = struct {
     exited: bool = false,
     /// The last status posted; only the main thread uses it.
     last: []u8 = &.{},
+    /// Stopped when the backend says the Den is gone (404, 409).
+    leaser: ?*Leaser = null,
 
     /// How long den waits at exit for the last PATCH. The backend is a
     /// local process; one that takes longer is broken.
@@ -138,11 +140,167 @@ const Pusher = struct {
                 return false;
             }
             log.warn("PATCH {s}: HTTP {d} {s}", .{ p.url, @backingInt(status), status.phrase() orelse "" });
+            // The Den is gone or was replaced: stop vouching for it.
+            if (status == .not_found or status == .conflict) if (p.leaser) |l| l.stop();
             return status.class() == .client_error and status != .too_many_requests;
         };
         return true;
     }
 };
+
+/// Holds a coordination.k8s.io/v1 Lease named after the Den, so the API
+/// server can tell a quiet den from a dead one: renewed every `renew_every`,
+/// it expires `duration` seconds after den stops renewing it. Only on a
+/// server whose discovery lists leases; it runs on its own thread, like
+/// Pusher.
+const Leaser = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// GET for discovery: <origin>/apis/coordination.k8s.io/v1.
+    discovery_url: []const u8,
+    /// Server-side apply target: .../namespaces/<ns>/leases/<name>?fieldManager=den&force=true.
+    url: []const u8,
+    unix_socket: ?[]const u8,
+    name: []const u8,
+    namespace: []const u8,
+    /// The Den's uid, for the owner reference; empty means none.
+    uid: []const u8,
+    /// <host>/<den's pid>.
+    holder: []const u8,
+    thread: std.Thread = undefined,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    stopping: bool = false,
+
+    const renew_every = 10 * std.time.ns_per_s;
+    const duration = 30;
+
+    fn start(l: *Leaser) !void {
+        l.thread = try std.Thread.spawn(.{}, run, .{l});
+    }
+
+    /// Stop renewing. The thread is left to finish on its own; it may be
+    /// stuck on a dead backend, and den exits soon after anyway.
+    fn stop(l: *Leaser) void {
+        l.mutex.lockUncancelable(l.io);
+        defer l.mutex.unlock(l.io);
+        l.stopping = true;
+        l.cond.broadcast(l.io);
+    }
+
+    fn run(l: *Leaser) void {
+        var client: std.http.Client = .{ .allocator = l.gpa, .io = l.io };
+        defer client.deinit();
+        var time_buf: [27]u8 = undefined;
+        const acquired = l.now(&time_buf);
+        var served = false;
+        l.mutex.lockUncancelable(l.io);
+        defer l.mutex.unlock(l.io);
+        while (!l.stopping) {
+            l.mutex.unlock(l.io);
+            if (!served) served = switch (l.discover(&client)) {
+                .yes => true,
+                .no => {
+                    l.mutex.lockUncancelable(l.io);
+                    return;
+                },
+                .retry => false,
+            };
+            if (served) l.renew(&client, acquired);
+            l.mutex.lockUncancelable(l.io);
+            const next: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(renew_every), .clock = .awake } };
+            const until = next.toDeadline(l.io);
+            while (!l.stopping) l.cond.waitTimeout(l.io, &l.mutex, until) catch break;
+        }
+    }
+
+    /// Whether the server serves leases: a 4xx or anything but a
+    /// discovery list listing leases with patch means no, for good.
+    fn discover(l: *Leaser, client: *std.http.Client) enum { yes, no, retry } {
+        var arena: std.heap.ArenaAllocator = .init(l.gpa);
+        defer arena.deinit();
+        var status: std.http.Status = .ok;
+        const body = fetch.get(client, arena.allocator(), l.discovery_url, l.unix_socket, &status) catch |err| {
+            if (err == error.HttpStatus and status.class() == .client_error and status != .too_many_requests) {
+                log.info("no Lease: GET {s}: HTTP {d}", .{ l.discovery_url, @backingInt(status) });
+                return .no;
+            }
+            log.warn("GET {s}: {s}", .{ l.discovery_url, @errorName(err) });
+            return .retry;
+        };
+        if (servesLeases(arena.allocator(), body)) return .yes;
+        log.info("no Lease: {s} does not list leases", .{l.discovery_url});
+        return .no;
+    }
+
+    fn renew(l: *Leaser, client: *std.http.Client, acquired: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(l.gpa);
+        defer arena.deinit();
+        var time_buf: [27]u8 = undefined;
+        const Owner = struct { apiVersion: []const u8 = "den.mkm.pub/v1alpha1", kind: []const u8 = "Den", name: []const u8, uid: []const u8 };
+        const owners: []const Owner = if (l.uid.len > 0) &.{.{ .name = l.name, .uid = l.uid }} else &.{};
+        const json = std.json.Stringify.valueAlloc(arena.allocator(), .{
+            .apiVersion = "coordination.k8s.io/v1",
+            .kind = "Lease",
+            .metadata = .{ .name = l.name, .namespace = l.namespace, .ownerReferences = owners },
+            .spec = .{
+                .holderIdentity = l.holder,
+                .leaseDurationSeconds = duration,
+                .acquireTime = acquired,
+                .renewTime = l.now(&time_buf),
+            },
+        }, .{}) catch return;
+        var status: std.http.Status = .ok;
+        fetch.apply(client, arena.allocator(), l.url, l.unix_socket, json, &status) catch |err| {
+            if (err == error.HttpStatus)
+                log.warn("PATCH {s}: HTTP {d} {s}", .{ l.url, @backingInt(status), status.phrase() orelse "" })
+            else
+                log.warn("PATCH {s}: {s}", .{ l.url, @errorName(err) });
+        };
+    }
+
+    /// Now as a Kubernetes MicroTime: 2026-11-03T10:12:44.123456Z.
+    fn now(l: *Leaser, buf: *[27]u8) []const u8 {
+        const us: u64 = @intCast(@divTrunc(std.Io.Clock.real.now(l.io).nanoseconds, std.time.ns_per_us));
+        var secs: [20]u8 = undefined;
+        const s = spec.rfc3339(&secs, us / std.time.us_per_s);
+        return std.fmt.bufPrint(buf, "{s}.{d:0>6}Z", .{ s[0 .. s.len - 1], us % std.time.us_per_s }) catch unreachable;
+    }
+};
+
+/// Whether `body`, a discovery APIResourceList, lists leases with patch.
+fn servesLeases(arena: std.mem.Allocator, body: []const u8) bool {
+    const List = struct { resources: []const struct { name: []const u8, verbs: []const []const u8 = &.{} } = &.{} };
+    const list = std.json.parseFromSliceLeaky(List, arena, body, .{ .ignore_unknown_fields = true }) catch return false;
+    for (list.resources) |r| if (std.mem.eql(u8, r.name, "leases")) {
+        for (r.verbs) |v| if (std.mem.eql(u8, v, "patch")) return true;
+    };
+    return false;
+}
+
+test servesLeases {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(servesLeases(a,
+        \\{"kind":"APIResourceList","groupVersion":"coordination.k8s.io/v1",
+        \\ "resources":[{"name":"leases","namespaced":true,"kind":"Lease","verbs":["create","get","patch","update"]}]}
+    ));
+    try std.testing.expect(!servesLeases(a,
+        \\{"resources":[{"name":"leases","verbs":["get"]}]}
+    ));
+    try std.testing.expect(!servesLeases(a, "{\"resources\":[]}"));
+    try std.testing.expect(!servesLeases(a, "<html>not found</html>"));
+}
+
+fn hostnameBuf(buf: *[256]u8) []const u8 {
+    return if (c.gethostname(buf, buf.len) == 0) std.mem.sliceTo(buf, 0) else "";
+}
+
+fn hostname(a: std.mem.Allocator) []const u8 {
+    var buf: [256]u8 = undefined;
+    return a.dupe(u8, hostnameBuf(&buf)) catch "";
+}
 
 /// What clients are told about through `event` frames.
 const State = struct {
@@ -201,6 +359,10 @@ pub const Server = struct {
     /// Nanoseconds between status PATCHes.
     status_interval: u64 = 5 * std.time.ns_per_s,
     pusher: ?Pusher = null,
+    /// The API server the spec came from (fetch.apiUrl), asked whether it
+    /// serves Leases; null when the spec came from a file.
+    api_url: ?[]const u8 = null,
+    leaser: ?Leaser = null,
 
     pub fn run(s: *Server) !void {
         try sys.openSignalPipe();
@@ -232,8 +394,27 @@ pub const Server = struct {
 
         try s.spawn();
         log.info("running pid={d} socket={s}", .{ s.pid, s.socket_path });
+        // Never freed: the Leaser thread may outlive run() by a moment.
+        var lease_strings: std.heap.ArenaAllocator = .init(s.gpa);
+        if (s.api_url) |base| {
+            const a = lease_strings.allocator();
+            const m = s.den.metadata;
+            s.leaser = .{
+                .gpa = s.gpa,
+                .io = s.io,
+                .discovery_url = try std.fmt.allocPrint(a, "{s}/apis/coordination.k8s.io/v1", .{base}),
+                .url = try std.fmt.allocPrint(a, "{s}/apis/coordination.k8s.io/v1/namespaces/{s}/leases/{s}?fieldManager=den&force=true", .{ base, m.namespace, m.name }),
+                .unix_socket = s.unix_socket,
+                .name = m.name,
+                .namespace = m.namespace,
+                .uid = m.uid,
+                .holder = try std.fmt.allocPrint(a, "{s}/{d}", .{ hostname(a), c.getpid() }),
+            };
+            try s.leaser.?.start();
+        }
+        defer if (s.leaser) |*l| l.stop();
         if (s.status_url) |url| {
-            s.pusher = .{ .gpa = s.gpa, .io = s.io, .url = url, .unix_socket = s.unix_socket, .interval = s.status_interval };
+            s.pusher = .{ .gpa = s.gpa, .io = s.io, .url = url, .unix_socket = s.unix_socket, .interval = s.status_interval, .leaser = if (s.leaser) |*l| l else null };
             try s.pusher.?.start();
         }
         // Then after every round: whatever changes the status wakes poll.
@@ -703,10 +884,7 @@ pub const Server = struct {
     /// been deleted, even if one with the same name was created since.
     fn statusJson(s: *Server, patch: bool) ![]u8 {
         var host_buf: [256]u8 = undefined;
-        const host: []const u8 = if (c.gethostname(&host_buf, host_buf.len) == 0)
-            std.mem.sliceTo(&host_buf, 0)
-        else
-            "";
+        const host = hostnameBuf(&host_buf);
         var time_buf: [20]u8 = undefined;
         const last = if (s.last_output) |ns| spec.rfc3339(&time_buf, @intCast(@divTrunc(ns, std.time.ns_per_s))) else null;
         var clients: usize = 0;

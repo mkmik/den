@@ -537,11 +537,15 @@ test "attach inside a den refuses" {
 }
 
 /// A backend for one den: serves `spec` on GET and keeps PATCH bodies
-/// until one contains `"exitCode":7`.
+/// until one contains `"exitCode":7`. With `leases`, its discovery lists
+/// Leases and it keeps Lease applies too; without, discovery is a 404.
 const Backend = struct {
     server: std.Io.net.Server,
     spec: []const u8,
+    leases: bool = false,
     patches: std.ArrayList(u8) = .empty,
+    /// Lease server-side apply bodies.
+    applies: std.ArrayList(u8) = .empty,
     /// "METHOD target" of every request.
     requests: std.ArrayList(u8) = .empty,
 
@@ -559,13 +563,22 @@ const Backend = struct {
             var http: std.http.Server = .init(&r.interface, &w.interface);
             var req = try http.receiveHead();
             try b.requests.print(gpa, "{s} {s}\n", .{ @tagName(req.head.method), req.head.target });
+            if (std.mem.eql(u8, req.head.target, "/apis/coordination.k8s.io/v1")) {
+                try req.respond(if (b.leases)
+                    \\{"kind":"APIResourceList","resources":[{"name":"leases","verbs":["create","patch"]}]}
+                else
+                    "", .{ .status = if (b.leases) .ok else .not_found, .keep_alive = false });
+                continue;
+            }
             if (req.head.method == .PATCH) {
-                try testing.expectEqualStrings("application/merge-patch+json", req.head.content_type.?);
+                const lease = std.mem.startsWith(u8, req.head.target, "/apis/coordination.k8s.io/");
+                try testing.expectEqualStrings(if (lease) "application/apply-patch+yaml" else "application/merge-patch+json", req.head.content_type.?);
                 var bbuf: [256]u8 = undefined;
                 const body = try req.readerExpectNone(&bbuf).allocRemaining(gpa, .limited(1 << 16));
                 defer gpa.free(body);
-                try b.patches.appendSlice(gpa, body);
-                try b.patches.append(gpa, '\n');
+                const into = if (lease) &b.applies else &b.patches;
+                try into.appendSlice(gpa, body);
+                try into.append(gpa, '\n');
             }
             try req.respond(if (req.head.method == .GET) b.spec else "{}", .{ .keep_alive = false });
         }
@@ -588,6 +601,7 @@ test "a den read from a URL PATCHes its status there" {
     };
     defer b.server.deinit(testing.io);
     defer b.patches.deinit(gpa);
+    defer b.applies.deinit(gpa);
     defer b.requests.deinit(gpa);
     const t = try std.Thread.spawn(.{}, Backend.serve, .{&b});
     const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/dens/pushed?v=1", .{b.server.socket.address.getPort()});
@@ -595,10 +609,53 @@ test "a den read from a URL PATCHes its status there" {
     try apply(runtime, url);
     t.join();
 
-    try testing.expect(std.mem.startsWith(u8, b.requests.items, "GET /dens/pushed?v=1\nPATCH /dens/pushed/status?v=1\n"));
+    // The Lease checks run on their own thread, so only the spec GET is
+    // sure to come first. Discovery says no Leases, so none is applied.
+    try testing.expect(std.mem.startsWith(u8, b.requests.items, "GET /dens/pushed?v=1\n"));
+    try testing.expect(std.mem.indexOf(u8, b.requests.items, "PATCH /dens/pushed/status?v=1\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b.requests.items, "GET /apis/coordination.k8s.io/v1\n") != null);
+    try testing.expectEqual(0, b.applies.items.len);
     try testing.expect(std.mem.startsWith(u8, b.patches.items, "{\"metadata\":{\"uid\":\"u1\"},\"status\":{\"phase\":\"Running\""));
     try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"status\":{\"phase\":\"Exited\",\"exitCode\":7,") != null);
     try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"observedGeneration\":3}}\n") != null);
+}
+
+test "a den on a server that serves Leases holds one" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-l{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+
+    const ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var b: Backend = .{
+        .server = try ip.listen(testing.io, .{ .reuse_address = true }),
+        .leases = true,
+        .spec =
+        \\{"kind":"Den","metadata":{"name":"held","namespace":"test","uid":"u2"},
+        \\ "spec":{"command":["/bin/sh","-c","sleep 1; exit 7"],"history":{"keepAfterExit":"0s"}}}
+        ,
+    };
+    defer b.server.deinit(testing.io);
+    defer b.patches.deinit(gpa);
+    defer b.applies.deinit(gpa);
+    defer b.requests.deinit(gpa);
+    const t = try std.Thread.spawn(.{}, Backend.serve, .{&b});
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/apis/den.mkm.pub/v1alpha1/namespaces/test/dens/held", .{b.server.socket.address.getPort()});
+    defer gpa.free(url);
+    try apply(runtime, url);
+    t.join();
+
+    try testing.expect(std.mem.indexOf(u8, b.requests.items, "PATCH /apis/coordination.k8s.io/v1/namespaces/test/leases/held?fieldManager=den&force=true\n") != null);
+    const want =
+        \\{"apiVersion":"coordination.k8s.io/v1","kind":"Lease","metadata":{"name":"held","namespace":"test",
+    ++
+        \\"ownerReferences":[{"apiVersion":"den.mkm.pub/v1alpha1","kind":"Den","name":"held","uid":"u2"}]},
+    ++
+        \\"spec":{"holderIdentity":"
+    ;
+    try testing.expect(std.mem.startsWith(u8, b.applies.items, want));
+    try testing.expect(std.mem.indexOf(u8, b.applies.items, "\"leaseDurationSeconds\":30,\"acquireTime\":\"") != null);
+    try testing.expect(std.mem.indexOf(u8, b.applies.items, "Z\",\"renewTime\":\"") != null);
 }
 
 /// Serve `spec` on the first request, then take one more connection and

@@ -98,6 +98,21 @@ answers 5xx or 429. The last PATCH, after the program exits or on
 `den delete`, has phase `Exited` and goes out right away; den waits at most
 1 s for it before exiting. A spec read from a file reports nothing.
 
+den also holds a `coordination.k8s.io/v1` Lease named after the Den, so the
+server can tell a quiet den from a dead one. It first asks the server whether
+it serves Leases (`GET /apis/coordination.k8s.io/v1` on the spec URL's host
+or socket); when the answer lists `leases`, den applies
+
+    PATCH /apis/coordination.k8s.io/v1/namespaces/<ns>/leases/<name>?fieldManager=den&force=true
+    Content-Type: application/apply-patch+yaml
+
+with `holderIdentity` (`<host>/<den pid>`), `leaseDurationSeconds: 30`,
+`renewTime` and, when the spec had a `metadata.uid`, an owner reference to
+the Den, so the Lease goes away with it. den renews it every 10 s for as long
+as it runs, and stops when a status PATCH answers 404 or 409. When den is
+gone, the Lease simply expires. A server that answers discovery with a 4xx,
+or without `leases`, gets no Lease.
+
 den prints its socket path and goes into the background. The socket is
 `$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock`. Where `XDG_RUNTIME_DIR` is not
 set (macOS) it is `$XDG_STATE_HOME/den/<namespace>/<name>.sock`, which is
@@ -117,3 +132,5 @@ deletes the file when it exits.
 
 Length-prefixed binary frames over the Unix socket. The wire format is
 documented at the top of [`src/proto.zig`](src/proto.zig).
+
+Design and plans: [`docs/PRD.md`](docs/PRD.md).
