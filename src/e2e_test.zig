@@ -645,7 +645,11 @@ test "a backend that never answers does not keep den from exiting" {
     const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/dens/hung", .{server.socket.address.getPort()});
     defer gpa.free(url);
     try apply(runtime, url);
-    while (!got_patch.load(.acquire)) sys.sleepMs(20);
+    // The first status goes out at start, before the program does anything.
+    for (0..250) |_| {
+        if (got_patch.load(.acquire)) break;
+        sys.sleepMs(20);
+    } else return error.Timeout;
 
     const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/hung.sock", .{runtime});
     defer gpa.free(sock);

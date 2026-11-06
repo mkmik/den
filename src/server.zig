@@ -236,6 +236,8 @@ pub const Server = struct {
             s.pusher = .{ .gpa = s.gpa, .io = s.io, .url = url, .unix_socket = s.unix_socket, .interval = s.status_interval };
             try s.pusher.?.start();
         }
+        // Then after every round: whatever changes the status wakes poll.
+        try s.pushStatus();
 
         while (try s.tick()) try s.pushStatus();
 
