@@ -39,6 +39,12 @@
 //!     shutdown  c->d  empty; den stops the program the same way as on
 //!                     SIGTERM, then exits and closes every connection.
 //!                     Needs no attach.
+//!     upgrade   c->d  absolute path of a den binary. den execs it in its
+//!                     own process: the program, its PTY, the socket and
+//!                     every connection carry on (handoff.zig). Needs no
+//!                     attach.
+//!               d->c  u8 1 and the new den's version, or u8 0 and why
+//!                     the old den is still running
 //!
 //! Offsets count bytes the program has written to the PTY since den started.
 
@@ -56,6 +62,7 @@ pub const Type = enum(u8) {
     event = 9,
     status = 10,
     shutdown = 11,
+    upgrade = 12,
     _,
 };
 

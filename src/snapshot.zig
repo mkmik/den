@@ -21,20 +21,32 @@ const alt_modes = [_]vt.modes.Mode{
     .alt_screen, // 1047
     .alt_screen_legacy, // 47
 };
+/// alt_modes, then synchronized output, which only clients must not see.
+const masked_modes = alt_modes ++ [_]vt.modes.Mode{.synchronized_output};
 
-pub fn encode(alloc: std.mem.Allocator, term: *Terminal) ![]u8 {
+/// Who plays the snapshot back.
+pub const For = enum {
+    /// A client's terminal: it keeps its own palette and tabstops, and
+    /// must not see synchronized output (see `write`).
+    client,
+    /// den's own emulator after `den upgrade` (handoff.zig): everything the
+    /// formatter can restore, so later snapshots are as good as before.
+    handoff,
+};
+
+pub fn encode(alloc: std.mem.Allocator, term: *Terminal, for_: For) ![]u8 {
     var out: Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try write(&out.writer, term);
+    try write(&out.writer, term, for_);
     return out.toOwnedSlice();
 }
 
-pub fn write(w: *Writer, term: *Terminal) Writer.Error!void {
+pub fn write(w: *Writer, term: *Terminal, for_: For) Writer.Error!void {
     // Modes we must not replay through the formatter: synchronized output is
     // a handshake with the program's current client and would make a new
     // client defer rendering; the alternate-screen modes are emitted by hand.
-    var saved: [alt_modes.len + 1]bool = undefined;
-    const masked = alt_modes ++ [_]vt.modes.Mode{.synchronized_output};
+    var saved: [masked_modes.len]bool = undefined;
+    const masked = masked_modes[0 .. alt_modes.len + @intFromBool(for_ == .client)];
     for (masked, 0..) |m, i| {
         saved[i] = term.modes.get(m);
         term.modes.set(m, false);
@@ -65,10 +77,11 @@ pub fn write(w: *Writer, term: *Terminal) Writer.Error!void {
     var f: vt.formatter.TerminalFormatter = .init(term, .vt);
     f.content = .{ .selection = visible(active) };
     f.extra = .{
-        .palette = false,
+        .palette = for_ == .handoff,
         .modes = true,
         .scrolling_region = true,
-        .tabstops = false, // restoring tabstops moves the cursor after CUP
+        // Clients keep their own; the formatter homes the cursor after them.
+        .tabstops = for_ == .handoff,
         .pwd = false, // the formatter's OSC 7 includes a NUL sentinel; see below
         .keyboard = true,
         .screen = .all,
@@ -187,7 +200,7 @@ fn feed(t: *Terminal, input: []const u8) void {
 
 /// Replay `src`'s snapshot into a fresh terminal of the same size.
 fn replay(src: *Terminal) !Terminal {
-    const snap = try encode(testing.allocator, src);
+    const snap = try encode(testing.allocator, src, .client);
     defer testing.allocator.free(snap);
     const p = &src.screens.active.pages;
     return newTerm(p.cols, p.rows, snap);
@@ -251,7 +264,7 @@ test "alternate screen keeps main screen history after exit" {
 test "alternate screen entered with 1047 replays as 1047" {
     var src = try newTerm(20, 5, "main\r\n\x1b[?1047halt");
     defer src.deinit(testing.allocator);
-    const snap = try encode(testing.allocator, &src);
+    const snap = try encode(testing.allocator, &src, .client);
     defer testing.allocator.free(snap);
     try testing.expect(std.mem.indexOf(u8, snap, "\x1b[?1047h") != null);
     try testing.expect(std.mem.indexOf(u8, snap, "\x1b[?1049h") == null);
@@ -262,7 +275,7 @@ test "alternate screen entered with 1047 replays as 1047" {
 test "synchronized output is not replayed" {
     var src = try newTerm(20, 5, "\x1b[?2004h\x1b[?2026hhi");
     defer src.deinit(testing.allocator);
-    const snap = try encode(testing.allocator, &src);
+    const snap = try encode(testing.allocator, &src, .client);
     defer testing.allocator.free(snap);
     try testing.expect(std.mem.indexOf(u8, snap, "\x1b[?2004h") != null);
     try testing.expect(std.mem.indexOf(u8, snap, "\x1b[?2026h") == null);
@@ -292,4 +305,102 @@ test text {
     try testing.expect(std.mem.indexOf(u8, color, "\x1b[") != null);
     try testing.expect(std.mem.endsWith(u8, color, "\x1b[0m\n"));
     try testing.expect(std.mem.indexOf(u8, color, "\r") == null);
+}
+
+/// Replay `src`'s handoff snapshot into a fresh terminal of the same size.
+fn replayHandoff(src: *Terminal) !Terminal {
+    const snap = try encode(testing.allocator, src, .handoff);
+    defer testing.allocator.free(snap);
+    const p = &src.screens.active.pages;
+    return newTerm(p.cols, p.rows, snap);
+}
+
+/// Everything den's emulator keeps that later snapshots and answers to
+/// queries depend on.
+fn expectSameState(a: *Terminal, b: *Terminal) !void {
+    try testing.expectEqual(a.screens.active_key, b.screens.active_key);
+    try expectSameScreen(a, b);
+    const pa = try a.screens.get(.primary).?.dumpStringAlloc(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(pa);
+    const pb = try b.screens.get(.primary).?.dumpStringAlloc(testing.allocator, .{ .screen = .{} });
+    defer testing.allocator.free(pb);
+    try testing.expectEqualStrings(pa, pb);
+
+    try testing.expect(std.meta.eql(a.modes.values, b.modes.values));
+    for (0..a.cols) |col| try testing.expectEqual(a.tabstops.get(col), b.tabstops.get(col));
+    try testing.expect(std.meta.eql(a.colors.palette.current, b.colors.palette.current));
+    try testing.expect(std.meta.eql(a.colors.foreground.override, b.colors.foreground.override));
+    try testing.expect(std.meta.eql(a.colors.background.override, b.colors.background.override));
+    try testing.expect(std.meta.eql(a.colors.cursor.override, b.colors.cursor.override));
+    try testing.expect(std.meta.eql(a.scrolling_region, b.scrolling_region));
+    try testing.expectEqualStrings(a.getTitle() orelse "", b.getTitle() orelse "");
+    try testing.expectEqualStrings(a.getPwd() orelse "", b.getPwd() orelse "");
+
+    const sa = a.screens.active;
+    const sb = b.screens.active;
+    try testing.expect(std.meta.eql(sa.cursor.style, sb.cursor.style));
+    try testing.expectEqual(sa.cursor.cursor_style, sb.cursor.cursor_style);
+    try testing.expectEqual(sa.cursor.pending_wrap, sb.cursor.pending_wrap);
+    try testing.expectEqual(sa.cursor.protected, sb.cursor.protected);
+    try testing.expect(std.meta.eql(sa.charset, sb.charset));
+    try testing.expectEqual(sa.kitty_keyboard.current(), sb.kitty_keyboard.current());
+}
+
+test "handoff snapshot restores the emulator's state" {
+    var src = try newTerm(40, 10, lines50 ++
+        "\x1b]4;1;rgb:12/34/56\x1b\\" ++ // palette entry 1
+        "\x1b]10;rgb:ab/cd/ef\x1b\\\x1b]11;rgb:01/02/03\x1b\\" ++ // fg, bg
+        "\x1b[3g\x1b[5G\x1bH\x1b[17G\x1bH\x1b[1G" ++ // tabstops at 5 and 17
+        "\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?2026h\x1b[?25l" ++ // paste, mouse, sync, hidden cursor
+        "\x1b[2;8r" ++ // scrolling region
+        "\x1b(0" ++ // G0 is DEC line drawing
+        "\x1b[>5u" ++ // kitty keyboard flags
+        "\x1b[5 q" ++ // blinking bar cursor
+        "\x1b]2;title\x07\x1b]7;file://h/tmp\x1b\\" ++
+        "\x1b[1;31mred\x1b[4;12H"); // the pen stays bold red
+    defer src.deinit(testing.allocator);
+    var dst = try replayHandoff(&src);
+    defer dst.deinit(testing.allocator);
+    try expectSameState(&src, &dst);
+    try testing.expect(dst.modes.get(.synchronized_output));
+    try testing.expect(dst.tabstops.get(4) and dst.tabstops.get(16) and !dst.tabstops.get(8));
+
+    // Both keep going the same way.
+    const more = "q\x1b(B\x1b[0mplain\r\nx\x1b[r\x1b[10;1H\r\n\r\n";
+    feed(&src, more);
+    feed(&dst, more);
+    try expectSameState(&src, &dst);
+}
+
+test "handoff snapshot on the alternate screen" {
+    var src = try newTerm(40, 10, lines50 ++ "$ vim\r\n\x1b[?1049h\x1b[2J\x1b[Hvim buffer\x1b[5;3H\x1b[>1u");
+    defer src.deinit(testing.allocator);
+    var dst = try replayHandoff(&src);
+    defer dst.deinit(testing.allocator);
+    try expectSameState(&src, &dst);
+    feed(&src, "\x1b[<u\x1b[?1049l$ ");
+    feed(&dst, "\x1b[<u\x1b[?1049l$ ");
+    try expectSameState(&src, &dst);
+}
+
+test "handoff snapshot with pending wrap" {
+    // The last column is written: the next character wraps.
+    var src = try newTerm(10, 4, "0123456789");
+    defer src.deinit(testing.allocator);
+    try testing.expect(src.screens.active.cursor.pending_wrap);
+    var dst = try replayHandoff(&src);
+    defer dst.deinit(testing.allocator);
+    try expectSameState(&src, &dst);
+    feed(&src, "x");
+    feed(&dst, "x");
+    try expectSameState(&src, &dst);
+}
+
+test "client snapshot leaves palette, tabstops and synchronized output out" {
+    var src = try newTerm(20, 5, "\x1b]4;1;rgb:12/34/56\x1b\\\x1b[3g\x1b[?2026h");
+    defer src.deinit(testing.allocator);
+    const snap = try encode(testing.allocator, &src, .client);
+    defer testing.allocator.free(snap);
+    for ([_][]const u8{ "\x1b]4;", "\x1b[3g", "\x1b[?2026h" }) |seq|
+        try testing.expect(std.mem.indexOf(u8, snap, seq) == null);
 }

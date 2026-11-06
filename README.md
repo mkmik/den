@@ -52,6 +52,7 @@ must be valid JSON; anchors, tags and `|`/`>` block text are not supported.
     den get -f den.yaml        # the resource with status filled in (-o yaml|json)
     den logs -f den.yaml       # scrollback and screen as text (--color keeps colors)
     den send -f den.yaml make test   # type "make test" and Enter (-n: no Enter)
+    den upgrade -f den.yaml    # switch the running den to this den binary
     den delete -f den.yaml     # stop the program and den
 
 Without `command`, den runs your login shell (from the password database) as
@@ -127,6 +128,38 @@ screen and scrollback to `$XDG_STATE_HOME/den/<namespace>/<name>.final`
 (default `~/.local/state/den/...`, mode 0600), frees the terminal emulator,
 and answers attaches from that file. An exited den uses about 1 MB. den
 deletes the file when it exits.
+
+## Upgrade
+
+`den upgrade -f den.yaml` replaces a running den with the den binary you run
+it with, without stopping the program. The program keeps its process, its
+terminal and its screen, and attached clients stay attached; output and input
+that were on their way are not lost. Use it after building or installing a
+new den:
+
+    zig build && ./zig-out/bin/den upgrade -f den.yaml
+
+den replaces itself (exec) instead of starting a second process, so it stays
+the program's parent and keeps every open file: the terminal, the socket, and
+the client connections. What den only had in memory (the screen, scrollback,
+client state) goes to the new den through a file in the state directory,
+which den deletes right away. The screen goes as a snapshot: escape sequences that
+every den version reads the same way. `den get` shows the running version as
+`status.denVersion`. A den whose spec came from a URL keeps PATCHing its
+status there, and keeps renewing its Lease with the same holder (den's PID
+does not change); the first PATCH from the new den carries the new version. See
+[`src/handoff.zig`](src/handoff.zig).
+
+Before replacing itself, den runs the new binary with `__handoff-version` to
+check it can read what den will hand over; if not, den keeps running and
+`den upgrade` says why. If the program is in the middle of writing an escape
+sequence, den waits for it to finish (up to 2 seconds). Dens started before
+`den upgrade` existed cannot be upgraded; restart them with `den delete`, then
+`den apply`.
+
+What does not carry over: a cursor position saved with DECSC (ESC 7), images,
+and shell prompt marks. These only affect what a client that attaches after the
+upgrade sees.
 
 ## Protocol
 

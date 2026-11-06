@@ -8,6 +8,7 @@ pub const winsize = extern struct { row: u16, col: u16, xpixel: u16 = 0, ypixel:
 
 pub extern "c" fn forkpty(master: *c_int, name: ?[*:0]u8, termp: ?*const anyopaque, winp: ?*const winsize) c.pid_t;
 pub extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+pub extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
 pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const TIOCSWINSZ: u32 = if (@import("builtin").os.tag.isDarwin()) 0x80087467 else c.T.IOCSWINSZ;
@@ -25,6 +26,11 @@ pub fn setNonblock(fd: c.fd_t) !void {
 
 pub fn setCloexec(fd: c.fd_t) void {
     _ = c.fcntl(fd, c.F.SETFD, @as(c_int, c.FD_CLOEXEC));
+}
+
+/// Let `fd` survive exec (den upgrade).
+pub fn clearCloexec(fd: c.fd_t) void {
+    _ = c.fcntl(fd, c.F.SETFD, @as(c_int, 0));
 }
 
 /// Not poll() with no fds: an empty slice has an undefined pointer, and
@@ -71,10 +77,37 @@ pub fn ignoreSigpipe() void {
     posix.sigaction(.PIPE, &act, null);
 }
 
-/// Exec keeps ignored signals ignored; give the program default SIGPIPE.
+/// Exec keeps ignored signals ignored and blocked signals blocked; give
+/// the program default SIGPIPE and no blocked signals.
 pub fn resetSignals() void {
     const act: posix.Sigaction = .{ .handler = .{ .handler = c.SIG.DFL }, .mask = posix.sigemptyset(), .flags = 0 };
     posix.sigaction(.PIPE, &act, null);
+    const none = posix.sigemptyset();
+    posix.sigprocmask(c.SIG.SETMASK, &none, null);
+}
+
+/// The signals den handles (see Server.run).
+pub const den_signals = [_]c.SIG{ .CHLD, .TERM, .INT };
+
+/// Hold den's signals back. They stay pending, through exec too, until
+/// `unblockSignals`.
+pub fn blockSignals() void {
+    var set = posix.sigemptyset();
+    for (den_signals) |sig| posix.sigaddset(&set, sig);
+    posix.sigprocmask(c.SIG.BLOCK, &set, null);
+}
+
+pub fn unblockSignals() void {
+    var set = posix.sigemptyset();
+    for (den_signals) |sig| posix.sigaddset(&set, sig);
+    posix.sigprocmask(c.SIG.UNBLOCK, &set, null);
+}
+
+/// Put signals taken out of the pipe back in, as if they came again.
+pub fn requeue(got: Got) void {
+    if (got.chld) wake(.CHLD);
+    if (got.term) wake(.TERM);
+    if (got.winch) wake(.WINCH);
 }
 
 pub const Got = struct { chld: bool = false, term: bool = false, winch: bool = false };
