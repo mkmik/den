@@ -1,5 +1,6 @@
 //! Read the Den spec that `-f` names: a path, or a file:, http:, https: or
-//! http+unix: URL; and PATCH den's status back to an HTTP one.
+//! http+unix: URL; PATCH den's status back to an HTTP one; and talk to the
+//! API server behind it (discovery, Lease).
 //!
 //! Two ways to ask an HTTP server on a Unix socket, say /run/api.sock:
 //!
@@ -26,6 +27,11 @@ pub fn read(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, arg: []con
     return exchange(&client, arena, arg, unix_socket, null, status);
 }
 
+/// GET `url` with a client den keeps around. Errors as `read`.
+pub fn get(client: *std.http.Client, arena: std.mem.Allocator, url: []const u8, unix_socket: ?[]const u8, status: *std.http.Status) ![]u8 {
+    return exchange(client, arena, url, unix_socket, null, status);
+}
+
 /// Where den reports its status when the spec came from `arg`: the URL with
 /// /status added to its path, like a Kubernetes status subresource
 /// (.../dens/build -> .../dens/build/status). Null for a path or file: URL.
@@ -37,20 +43,43 @@ pub fn statusUrl(arena: std.mem.Allocator, arg: []const u8) !?[]const u8 {
     return try std.fmt.allocPrint(arena, "{s}/status{s}", .{ std.mem.trimEnd(u8, arg[0..end], "/"), arg[end..] });
 }
 
+/// `path` on the server the spec at `arg` came from: its scheme and host
+/// (for http+unix:, the socket) with `path` in place of the rest, where a
+/// Kubernetes-style API server answers /apis/... Null for a path or file: URL.
+pub fn apiUrl(arena: std.mem.Allocator, arg: []const u8, path: []const u8) !?[]const u8 {
+    const uri = std.Uri.parse(arg) catch return null;
+    if (std.mem.eql(u8, uri.scheme, "file")) return null;
+    // The authority holds no / (http+unix writes the socket's as %2F).
+    const start = (std.mem.indexOf(u8, arg, "://") orelse return null) + 3;
+    const end = std.mem.indexOfAnyPos(u8, arg, start, "/?#") orelse arg.len;
+    return try std.fmt.allocPrint(arena, "{s}{s}", .{ arg[0..end], path });
+}
+
 /// PATCH `url` with `merge_patch`, a JSON merge patch (RFC 7396), the way
 /// `kubectl patch --subresource=status --type=merge` does. `url` and
 /// `unix_socket` are read as in `read`. Errors as `read`.
 pub fn patch(client: *std.http.Client, arena: std.mem.Allocator, url: []const u8, unix_socket: ?[]const u8, merge_patch: []const u8, status: *std.http.Status) !void {
-    _ = try exchange(client, arena, url, unix_socket, merge_patch, status);
+    _ = try exchange(client, arena, url, unix_socket, .{ .type = merge_patch_type, .data = merge_patch }, status);
 }
 
-/// GET `arg`, or PATCH it with `merge_patch`, and return the response body.
-fn exchange(client: *std.http.Client, arena: std.mem.Allocator, arg: []const u8, unix_socket: ?[]const u8, merge_patch: ?[]const u8, status: *std.http.Status) ![]u8 {
+/// PATCH `url` with `object` as a server-side apply, the way `kubectl apply
+/// --server-side` does: creates the object or updates the fields den owns.
+/// `url` names the object and carries ?fieldManager=. Errors as `read`.
+pub fn apply(client: *std.http.Client, arena: std.mem.Allocator, url: []const u8, unix_socket: ?[]const u8, object: []const u8, status: *std.http.Status) !void {
+    // JSON is YAML.
+    _ = try exchange(client, arena, url, unix_socket, .{ .type = "application/apply-patch+yaml", .data = object }, status);
+}
+
+/// A PATCH body and its content type.
+const Patch = struct { type: []const u8, data: []const u8 };
+
+/// GET `arg`, or PATCH it with `out`, and return the response body.
+fn exchange(client: *std.http.Client, arena: std.mem.Allocator, arg: []const u8, unix_socket: ?[]const u8, out: ?Patch, status: *std.http.Status) ![]u8 {
     const io = client.io;
     // No scheme: a path, absolute or relative.
     const uri = std.Uri.parse(arg) catch {
         if (unix_socket != null) return error.UnixSocketNeedsHttp;
-        if (merge_patch != null) return error.UnsupportedUrl;
+        if (out != null) return error.UnsupportedUrl;
         return Io.Dir.cwd().readFileAlloc(io, arg, arena, .limited(max_len));
     };
     const scheme = std.meta.stringToEnum(enum { file, http, https, @"http+unix" }, uri.scheme) orelse
@@ -58,24 +87,24 @@ fn exchange(client: *std.http.Client, arena: std.mem.Allocator, arg: []const u8,
     if (unix_socket) |sock| {
         if (scheme != .http) return error.UnixSocketNeedsHttp;
         const host = try std.fmt.allocPrint(arena, "{f}", .{uri.fmt(.{ .authority = true })});
-        return httpUnix(arena, io, sock, host, uri, merge_patch, status);
+        return httpUnix(arena, io, sock, host, uri, out, status);
     }
     switch (scheme) {
         .file => {
-            if (merge_patch != null) return error.UnsupportedUrl;
+            if (out != null) return error.UnsupportedUrl;
             return Io.Dir.cwd().readFileAlloc(io, try filePath(arena, uri), arena, .limited(max_len));
         },
         .http, .https => {
-            var req = try client.request(if (merge_patch != null) .PATCH else .GET, uri, .{
-                .headers = .{ .content_type = if (merge_patch != null) .{ .override = merge_patch_type } else .default },
+            var req = try client.request(if (out != null) .PATCH else .GET, uri, .{
+                .headers = .{ .content_type = if (out) |p| .{ .override = p.type } else .default },
                 // Only bodiless requests can follow redirects.
-                .redirect_behavior = if (merge_patch != null) .unhandled else @fromBackingInt(3),
+                .redirect_behavior = if (out != null) .unhandled else @fromBackingInt(3),
             });
             defer req.deinit();
-            if (merge_patch) |p| {
-                req.transfer_encoding = .{ .content_length = p.len };
+            if (out) |p| {
+                req.transfer_encoding = .{ .content_length = p.data.len };
                 var bw = try req.sendBodyUnflushed(&.{});
-                try bw.writer.writeAll(p);
+                try bw.writer.writeAll(p.data);
                 try bw.end();
                 try req.connection.?.flush();
             } else try req.sendBodiless();
@@ -85,27 +114,27 @@ fn exchange(client: *std.http.Client, arena: std.mem.Allocator, arg: []const u8,
         },
         .@"http+unix" => {
             const sock = uri.host orelse return error.UnsupportedUrl;
-            return httpUnix(arena, io, try sock.toRawMaybeAlloc(arena), "localhost", uri, merge_patch, status);
+            return httpUnix(arena, io, try sock.toRawMaybeAlloc(arena), "localhost", uri, out, status);
         },
     }
 }
 
 const merge_patch_type = "application/merge-patch+json";
 
-/// GET `uri`'s path and query, or PATCH it with `merge_patch`, from the
+/// GET `uri`'s path and query, or PATCH it with `out`, from the
 /// HTTP server on the Unix socket `sock`. No redirects, no TLS.
-fn httpUnix(arena: std.mem.Allocator, io: Io, sock: []const u8, host: []const u8, uri: std.Uri, merge_patch: ?[]const u8, status: *std.http.Status) ![]u8 {
+fn httpUnix(arena: std.mem.Allocator, io: Io, sock: []const u8, host: []const u8, uri: std.Uri, out: ?Patch, status: *std.http.Status) ![]u8 {
     const addr = try Io.net.UnixAddress.init(sock);
     const stream = try addr.connect(io);
     defer stream.close(io);
     var wbuf: [1024]u8 = undefined;
     var w = stream.writer(io, &wbuf);
     try w.interface.print("{s} {f} HTTP/1.1\r\nhost: {s}\r\nuser-agent: den\r\nconnection: close\r\n", .{
-        if (merge_patch != null) "PATCH" else "GET", uri.fmt(.{ .path = true, .query = true }), host,
+        if (out != null) "PATCH" else "GET", uri.fmt(.{ .path = true, .query = true }), host,
     });
-    if (merge_patch) |p| try w.interface.print("content-type: " ++ merge_patch_type ++ "\r\ncontent-length: {d}\r\n", .{p.len});
+    if (out) |p| try w.interface.print("content-type: {s}\r\ncontent-length: {d}\r\n", .{ p.type, p.data.len });
     try w.interface.writeAll("\r\n");
-    if (merge_patch) |p| try w.interface.writeAll(p);
+    if (out) |p| try w.interface.writeAll(p.data);
     try w.interface.flush();
     var rbuf: [16 * 1024]u8 = undefined;
     var r = stream.reader(io, &rbuf);
@@ -239,6 +268,23 @@ test statusUrl {
     try testing.expectEqual(null, try statusUrl(a, "den.yaml"));
     try testing.expectEqual(null, try statusUrl(a, "/abs/den.yaml"));
     try testing.expectEqual(null, try statusUrl(a, "file:///abs/den.yaml"));
+}
+
+test apiUrl {
+    const a = testing.allocator;
+    const p = "/apis/coordination.k8s.io/v1";
+    for ([_][2][]const u8{
+        .{ "http://api/apis/den.mkm.pub/v1alpha1/namespaces/n/dens/b", "http://api" ++ p },
+        .{ "https://h:8443/dens/build/?x=1", "https://h:8443" ++ p },
+        .{ "http://h?x=1", "http://h" ++ p },
+        .{ "http+unix://%2Frun%2Fapi.sock/dens/build", "http+unix://%2Frun%2Fapi.sock" ++ p },
+    }) |case| {
+        const got = (try apiUrl(a, case[0], p)).?;
+        defer a.free(got);
+        try testing.expectEqualStrings(case[1], got);
+    }
+    try testing.expectEqual(null, try apiUrl(a, "den.yaml", p));
+    try testing.expectEqual(null, try apiUrl(a, "file:///abs/den.yaml", p));
 }
 
 /// What servePatch got: "METHOD target content-type body".

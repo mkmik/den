@@ -173,6 +173,7 @@ pub fn main(init: std.process.Init) !void {
         .listen_fd = listen_fd,
         .size = undefined,
         .status_url = fetch.statusUrl(arena, path) catch null,
+        .api_url = fetch.apiUrl(arena, path, "") catch null,
         .unix_socket = unix_socket,
         .status_interval = status_interval orelse 5 * std.time.ns_per_s,
     };
