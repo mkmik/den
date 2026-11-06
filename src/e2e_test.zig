@@ -88,7 +88,11 @@ fn spawnDen(runtime: []const u8, name: []const u8, command: []const []const u8, 
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = spec_path, .data = json });
     const spec_url = try std.fmt.allocPrint(gpa, "file://{s}", .{spec_path});
     defer gpa.free(spec_url);
+    try apply(runtime, spec_url);
+}
 
+/// `den apply -f url` with den's directories under `runtime`.
+fn apply(runtime: []const u8, url: []const u8) !void {
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     try env.put("XDG_RUNTIME_DIR", runtime);
@@ -96,7 +100,7 @@ fn spawnDen(runtime: []const u8, name: []const u8, command: []const []const u8, 
     defer gpa.free(state);
     try env.put("XDG_STATE_HOME", state);
     var child = try std.process.spawn(testing.io, .{
-        .argv = &.{ den_bin, "apply", "-f", spec_url },
+        .argv = &.{ den_bin, "apply", "-f", url },
         .environ_map = &env,
         .stdout = .ignore,
     });
@@ -530,4 +534,139 @@ test "attach inside a den refuses" {
     defer gpa.free(in);
     try testing.expect(std.mem.indexOf(u8, h, in) != null);
     try testing.expect(std.mem.indexOf(u8, h, "already inside the den") != null);
+}
+
+/// A backend for one den: serves `spec` on GET and keeps PATCH bodies
+/// until one contains `"exitCode":7`.
+const Backend = struct {
+    server: std.Io.net.Server,
+    spec: []const u8,
+    patches: std.ArrayList(u8) = .empty,
+    /// "METHOD target" of every request.
+    requests: std.ArrayList(u8) = .empty,
+
+    fn serve(b: *Backend) !void {
+        const io = testing.io;
+        while (std.mem.indexOf(u8, b.patches.items, "\"exitCode\":7") == null) {
+            var pfd = [_]std.posix.pollfd{.{ .fd = b.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&pfd, 10_000) == 0) return error.Timeout;
+            const stream = try b.server.accept(io);
+            defer stream.close(io);
+            var rbuf: [4096]u8 = undefined;
+            var wbuf: [4096]u8 = undefined;
+            var r = stream.reader(io, &rbuf);
+            var w = stream.writer(io, &wbuf);
+            var http: std.http.Server = .init(&r.interface, &w.interface);
+            var req = try http.receiveHead();
+            try b.requests.print(gpa, "{s} {s}\n", .{ @tagName(req.head.method), req.head.target });
+            if (req.head.method == .PATCH) {
+                try testing.expectEqualStrings("application/merge-patch+json", req.head.content_type.?);
+                var bbuf: [256]u8 = undefined;
+                const body = try req.readerExpectNone(&bbuf).allocRemaining(gpa, .limited(1 << 16));
+                defer gpa.free(body);
+                try b.patches.appendSlice(gpa, body);
+                try b.patches.append(gpa, '\n');
+            }
+            try req.respond(if (req.head.method == .GET) b.spec else "{}", .{ .keep_alive = false });
+        }
+    }
+};
+
+test "a den read from a URL PATCHes its status there" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-p{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+
+    const ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var b: Backend = .{
+        .server = try ip.listen(testing.io, .{ .reuse_address = true }),
+        .spec =
+        \\{"kind":"Den","metadata":{"name":"pushed","namespace":"test","uid":"u1","generation":3},
+        \\ "spec":{"command":["/bin/sh","-c","sleep 1; exit 7"],"history":{"keepAfterExit":"0s"}}}
+        ,
+    };
+    defer b.server.deinit(testing.io);
+    defer b.patches.deinit(gpa);
+    defer b.requests.deinit(gpa);
+    const t = try std.Thread.spawn(.{}, Backend.serve, .{&b});
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/dens/pushed?v=1", .{b.server.socket.address.getPort()});
+    defer gpa.free(url);
+    try apply(runtime, url);
+    t.join();
+
+    try testing.expect(std.mem.startsWith(u8, b.requests.items, "GET /dens/pushed?v=1\nPATCH /dens/pushed/status?v=1\n"));
+    try testing.expect(std.mem.startsWith(u8, b.patches.items, "{\"metadata\":{\"uid\":\"u1\"},\"status\":{\"phase\":\"Running\""));
+    try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"status\":{\"phase\":\"Exited\",\"exitCode\":7,") != null);
+    try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"observedGeneration\":3}}\n") != null);
+}
+
+/// Serve `spec` on the first request, then take one more connection and
+/// never answer it, until `release`.
+fn hangingBackend(server: *std.Io.net.Server, spec: []const u8, got_patch: *std.atomic.Value(bool), release: *std.atomic.Value(bool)) !void {
+    const io = testing.io;
+    {
+        const stream = try server.accept(io);
+        defer stream.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        var w = stream.writer(io, &wbuf);
+        var http: std.http.Server = .init(&r.interface, &w.interface);
+        var req = try http.receiveHead();
+        try req.respond(spec, .{ .keep_alive = false });
+    }
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    got_patch.store(true, .release);
+    while (!release.load(.acquire)) sys.sleepMs(20);
+}
+
+test "a backend that never answers does not keep den from exiting" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-h{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+
+    const ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try ip.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var got_patch: std.atomic.Value(bool) = .init(false);
+    var release: std.atomic.Value(bool) = .init(false);
+    const t = try std.Thread.spawn(.{}, hangingBackend, .{
+        &server,
+        \\{"kind":"Den","metadata":{"name":"hung","namespace":"test"},"spec":{"command":["/bin/sh","-c","sleep 60"]}}
+        ,
+        &got_patch,
+        &release,
+    });
+    defer t.join();
+    defer release.store(true, .release);
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/dens/hung", .{server.socket.address.getPort()});
+    defer gpa.free(url);
+    try apply(runtime, url);
+    // The first status goes out at start, before the program does anything.
+    for (0..250) |_| {
+        if (got_patch.load(.acquire)) break;
+        sys.sleepMs(20);
+    } else return error.Timeout;
+
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/hung.sock", .{runtime});
+    defer gpa.free(sock);
+    var k = try Conn.open(sock);
+    defer k.close();
+    try k.send(.shutdown, &.{});
+    while (true) _ = k.next() catch |err| {
+        try testing.expectEqual(error.Closed, err);
+        break;
+    };
+    // den gives up on the PATCH after 1 s, logs it, and exits.
+    const log_path = try std.fmt.allocPrint(gpa, "{s}/den/test/hung.log", .{runtime});
+    defer gpa.free(log_path);
+    for (0..150) |_| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, log_path, gpa, .limited(1 << 20));
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, "no answer within 1s") != null) break;
+        sys.sleepMs(20);
+    } else return error.Timeout;
 }

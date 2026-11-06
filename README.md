@@ -79,6 +79,25 @@ must be `http://`, and its host only goes in the Host header.
 Whatever comes back is read as if it came from a file. The server must answer 2xx; den reads at most 1 MiB
 and follows redirects only over TCP.
 
+When the spec came from an HTTP URL, den reports its status back to the same
+URL with `/status` added to the path (`.../dens/build` becomes
+`.../dens/build/status`, the query is kept), the way a Kubernetes status
+subresource works. Each time the status changes, den sends
+
+    PATCH .../dens/build/status
+    Content-Type: application/merge-patch+json
+
+    {"metadata":{"uid":"..."},"status":{"phase":"Running",...}}
+
+the same `status` that `den get` shows. `metadata.uid` is there only when the
+spec had one; a Kubernetes-style server answers 409 when it no longer matches
+(the Den was deleted and created again). den sends at most one PATCH every 5 s
+(`--status-interval`, e.g. `--status-interval 30s`), always the newest
+status, and retries at the same pace while the server is unreachable or
+answers 5xx or 429. The last PATCH, after the program exits or on
+`den delete`, has phase `Exited` and goes out right away; den waits at most
+1 s for it before exiting. A spec read from a file reports nothing.
+
 den prints its socket path and goes into the background. The socket is
 `$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock`. Where `XDG_RUNTIME_DIR` is not
 set (macOS) it is `$XDG_STATE_HOME/den/<namespace>/<name>.sock`, which is

@@ -7,6 +7,7 @@ const proto = @import("proto.zig");
 const snapshot = @import("snapshot.zig");
 const queries = @import("queries.zig");
 const sys = @import("sys.zig");
+const fetch = @import("fetch.zig");
 
 const c = std.c;
 const fd_t = c.fd_t;
@@ -34,6 +35,112 @@ const Client = struct {
         _ = c.close(cl.fd);
         cl.in.deinit(gpa);
         cl.out.deinit(gpa);
+    }
+};
+
+/// PATCHes den's status to the backend from its own thread, so a slow or
+/// dead backend never holds up the program. Only the newest status waits
+/// to be sent; at most one goes out per `interval`.
+const Pusher = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    url: []const u8,
+    unix_socket: ?[]const u8,
+    /// Nanoseconds between PATCHes, and between retries.
+    interval: u64,
+    thread: std.Thread = undefined,
+    mutex: std.Io.Mutex = .init,
+    /// Broadcast on every change below: the thread and `finish` both wait on it.
+    cond: std.Io.Condition = .init,
+    /// Owned; taken by the thread.
+    pending: ?[]u8 = null,
+    stopping: bool = false,
+    /// The thread has returned.
+    exited: bool = false,
+    /// The last status posted; only the main thread uses it.
+    last: []u8 = &.{},
+
+    /// How long den waits at exit for the last PATCH. The backend is a
+    /// local process; one that takes longer is broken.
+    const finish_timeout = 1;
+
+    fn start(p: *Pusher) !void {
+        p.thread = try std.Thread.spawn(.{}, run, .{p});
+    }
+
+    /// Queue `json` (owned) in place of anything not yet sent.
+    fn post(p: *Pusher, json: []u8) void {
+        p.mutex.lockUncancelable(p.io);
+        defer p.mutex.unlock(p.io);
+        if (p.pending) |old| p.gpa.free(old);
+        p.pending = json;
+        p.cond.broadcast(p.io);
+    }
+
+    /// Send what is pending right away, without waiting out the interval,
+    /// and stop. Gives up after `finish_timeout` seconds and leaves the
+    /// thread behind: den is about to exit, which ends it.
+    fn finish(p: *Pusher) void {
+        p.mutex.lockUncancelable(p.io);
+        p.stopping = true;
+        p.cond.broadcast(p.io);
+        const deadline: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(finish_timeout), .clock = .awake } };
+        const until = deadline.toDeadline(p.io);
+        while (!p.exited) p.cond.waitTimeout(p.io, &p.mutex, until) catch break;
+        const exited = p.exited;
+        p.mutex.unlock(p.io);
+        if (!exited) {
+            log.warn("PATCH {s}: no answer within {d}s; exiting without it", .{ p.url, finish_timeout });
+            return;
+        }
+        p.thread.join();
+        p.gpa.free(p.last);
+    }
+
+    fn run(p: *Pusher) void {
+        var client: std.http.Client = .{ .allocator = p.gpa, .io = p.io };
+        defer client.deinit();
+        p.mutex.lockUncancelable(p.io);
+        defer {
+            p.exited = true;
+            p.cond.broadcast(p.io);
+            p.mutex.unlock(p.io);
+        }
+        while (true) {
+            while (p.pending == null and !p.stopping) p.cond.waitUncancelable(p.io, &p.mutex);
+            const json = p.pending orelse return;
+            p.pending = null;
+            const stopping = p.stopping;
+            p.mutex.unlock(p.io);
+
+            const done = p.send(&client, json);
+            p.mutex.lockUncancelable(p.io);
+            // Retry unless something newer came in; never at exit.
+            if (!done and !stopping and p.pending == null) p.pending = json else p.gpa.free(json);
+            if (stopping and p.pending == null) return;
+            // Wait out the interval; stopping cuts it short.
+            const next: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(p.interval), .clock = .awake } };
+            const until = next.toDeadline(p.io);
+            while (!p.stopping) p.cond.waitTimeout(p.io, &p.mutex, until) catch break;
+        }
+    }
+
+    /// False when it is worth trying again: the backend was unreachable,
+    /// overloaded or broken. A 4xx answer will not change on a retry (409
+    /// means the Den was deleted and created again, so its uid changed).
+    fn send(p: *Pusher, client: *std.http.Client, json: []const u8) bool {
+        var arena: std.heap.ArenaAllocator = .init(p.gpa);
+        defer arena.deinit();
+        var status: std.http.Status = .ok;
+        fetch.patch(client, arena.allocator(), p.url, p.unix_socket, json, &status) catch |err| {
+            if (err != error.HttpStatus) {
+                log.warn("PATCH {s}: {s}", .{ p.url, @errorName(err) });
+                return false;
+            }
+            log.warn("PATCH {s}: HTTP {d} {s}", .{ p.url, @backingInt(status), status.phrase() orelse "" });
+            return status.class() == .client_error and status != .too_many_requests;
+        };
+        return true;
     }
 };
 
@@ -87,6 +194,13 @@ pub const Server = struct {
     cell_height: u16 = 0,
     /// A client sent `shutdown`.
     stopping: bool = false,
+    /// Where status changes are PATCHed (fetch.statusUrl), over
+    /// `unix_socket` if set; null when the spec came from a file.
+    status_url: ?[]const u8 = null,
+    unix_socket: ?[]const u8 = null,
+    /// Nanoseconds between status PATCHes.
+    status_interval: u64 = 5 * std.time.ns_per_s,
+    pusher: ?Pusher = null,
 
     pub fn run(s: *Server) !void {
         try sys.openSignalPipe();
@@ -118,8 +232,14 @@ pub const Server = struct {
 
         try s.spawn();
         log.info("running pid={d} socket={s}", .{ s.pid, s.socket_path });
+        if (s.status_url) |url| {
+            s.pusher = .{ .gpa = s.gpa, .io = s.io, .url = url, .unix_socket = s.unix_socket, .interval = s.status_interval };
+            try s.pusher.?.start();
+        }
+        // Then after every round: whatever changes the status wakes poll.
+        try s.pushStatus();
 
-        while (try s.tick()) {}
+        while (try s.tick()) try s.pushStatus();
 
         // Clean up before hanging up on clients, so a client that sees den
         // close (den delete) can count on den and its files being gone.
@@ -132,6 +252,11 @@ pub const Server = struct {
             cl.deinit(s.gpa);
             s.gpa.destroy(cl);
         }
+        // The last status (no clients, the program's exit code) goes out
+        // after clients are gone, so `den delete` does not wait for it.
+        s.clients.clearRetainingCapacity();
+        s.pushStatus() catch {};
+        if (s.pusher) |*p| p.finish();
         s.clients.deinit(s.gpa);
         s.pty_in.deinit(s.gpa);
         s.shown.deinit(s.gpa);
@@ -271,8 +396,7 @@ pub const Server = struct {
         if (got.chld and s.state.exit_code == null) {
             var status: c_int = 0;
             if (c.waitpid(s.pid, &status, std.c.W.NOHANG) == s.pid) {
-                const st: u32 = @bitCast(status);
-                const code: i32 = if (c.W.IFEXITED(st)) c.W.EXITSTATUS(st) else 128 + @as(i32, @intCast(@backingInt(c.W.TERMSIG(st))));
+                const code = exitCode(status);
                 // Output still in the PTY was written before the exit.
                 while (s.master >= 0 and try s.readPty()) {}
                 s.state.exit_code = code;
@@ -299,13 +423,16 @@ pub const Server = struct {
         }
         _ = c.kill(-s.pid, .HUP);
         _ = c.kill(-s.pid, .CONT);
+        var status: c_int = 0;
         const deadline = s.now() + 5 * std.time.ns_per_s;
         while (s.now() < deadline) {
-            if (c.waitpid(s.pid, null, std.c.W.NOHANG) == s.pid) return;
+            if (c.waitpid(s.pid, &status, std.c.W.NOHANG) == s.pid) break;
             sys.sleepMs(50);
+        } else {
+            _ = c.kill(-s.pid, .KILL);
+            _ = c.waitpid(s.pid, &status, 0);
         }
-        _ = c.kill(-s.pid, .KILL);
-        _ = c.waitpid(s.pid, null, 0);
+        s.state.exit_code = exitCode(status);
     }
 
     fn accept(s: *Server) !void {
@@ -479,7 +606,7 @@ pub const Server = struct {
             },
             .detach => cl.dead = true,
             .status => {
-                const json = try s.statusJson();
+                const json = try s.statusJson(false);
                 defer s.gpa.free(json);
                 try proto.append(s.gpa, &cl.out, .status, &.{json});
                 s.flush(cl);
@@ -570,7 +697,11 @@ pub const Server = struct {
         };
     }
 
-    fn statusJson(s: *Server) ![]u8 {
+    /// The resource with its status filled in or, with `patch`, the JSON
+    /// merge patch that sets the status: {"metadata":{"uid":...},"status":{...}}.
+    /// The uid makes the backend refuse it (409) once the Den it names has
+    /// been deleted, even if one with the same name was created since.
+    fn statusJson(s: *Server, patch: bool) ![]u8 {
         var host_buf: [256]u8 = undefined;
         const host: []const u8 = if (c.gethostname(&host_buf, host_buf.len) == 0)
             std.mem.sliceTo(&host_buf, 0)
@@ -581,7 +712,7 @@ pub const Server = struct {
         var clients: usize = 0;
         for (s.clients.items) |cl| clients += @intFromBool(cl.attached and !cl.dead);
         const st = s.fullState();
-        return spec.withStatus(s.gpa, s.resource, .{
+        const status: spec.Status = .{
             .phase = st.phase.?,
             .exitCode = st.exitCode,
             .pid = s.pid,
@@ -593,7 +724,24 @@ pub const Server = struct {
             .title = st.title.?,
             .cwd = st.cwd.?,
             .lastOutputTime = last,
-        });
+            .observedGeneration = if (s.den.metadata.generation != 0) s.den.metadata.generation else null,
+        };
+        if (patch) {
+            const uid = s.den.metadata.uid;
+            const meta: ?struct { uid: []const u8 } = if (uid.len > 0) .{ .uid = uid } else null;
+            return std.json.Stringify.valueAlloc(s.gpa, .{ .metadata = meta, .status = status }, .{ .emit_null_optional_fields = false });
+        }
+        return spec.withStatus(s.gpa, s.resource, status);
+    }
+
+    /// Hand the status to the pusher if it changed since last time.
+    fn pushStatus(s: *Server) !void {
+        const p = if (s.pusher) |*p| p else return;
+        const json = try s.statusJson(true);
+        if (std.mem.eql(u8, json, p.last)) return s.gpa.free(json);
+        s.gpa.free(p.last);
+        p.last = json;
+        p.post(try s.gpa.dupe(u8, json));
     }
 
     fn sendFullState(s: *Server, cl: *Client) !void {
@@ -667,6 +815,12 @@ pub const Server = struct {
         if (resize) try s.applySize();
     }
 };
+
+/// A waitpid status as a shell shows it: the exit code, or 128 + signal.
+fn exitCode(status: c_int) i32 {
+    const st: u32 = @bitCast(status);
+    return if (c.W.IFEXITED(st)) c.W.EXITSTATUS(st) else 128 + @as(i32, @intCast(@backingInt(c.W.TERMSIG(st))));
+}
 
 /// OSC 7 reports file://host/path; status wants the path.
 fn cwdPath(pwd: []const u8) []const u8 {
