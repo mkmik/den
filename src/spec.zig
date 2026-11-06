@@ -59,6 +59,9 @@ pub const Status = struct {
     cwd: []const u8,
     /// RFC 3339, UTC. Absent until the program writes something.
     lastOutputTime: ?[]const u8 = null,
+    /// The version of den running this resource; `den upgrade` changes it.
+    /// Absent from dens older than `den upgrade`.
+    denVersion: ?[]const u8 = null,
     /// metadata.generation of the spec den runs, when it has one.
     observedGeneration: ?i64 = null,
 };

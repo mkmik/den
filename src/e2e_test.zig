@@ -13,6 +13,8 @@ const Conn = struct {
     fd: std.c.fd_t,
     buf: std.ArrayList(u8) = .empty,
     frame: std.ArrayList(u8) = .empty,
+    /// How long `next` waits for a frame.
+    timeout_ms: i32 = 5000,
 
     fn open(path: []const u8) !Conn {
         // den has forked into the background by now, but give it a moment.
@@ -51,7 +53,7 @@ const Conn = struct {
                 return .{ .type = f.type, .payload = c.frame.items };
             }
             var pfd = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            if (try std.posix.poll(&pfd, 5000) == 0) return error.Timeout;
+            if (try std.posix.poll(&pfd, c.timeout_ms) == 0) return error.Timeout;
             var tmp: [64 * 1024]u8 = undefined;
             const n = std.c.read(c.fd, &tmp, tmp.len);
             if (n <= 0) return error.Closed;
@@ -548,6 +550,8 @@ const Backend = struct {
     applies: std.ArrayList(u8) = .empty,
     /// "METHOD target" of every request.
     requests: std.ArrayList(u8) = .empty,
+    /// Lease applies so far, for the test's own thread to wait on.
+    applied: std.atomic.Value(usize) = .init(0),
 
     fn serve(b: *Backend) !void {
         const io = testing.io;
@@ -579,6 +583,7 @@ const Backend = struct {
                 const into = if (lease) &b.applies else &b.patches;
                 try into.appendSlice(gpa, body);
                 try into.append(gpa, '\n');
+                if (lease) _ = b.applied.fetchAdd(1, .release);
             }
             try req.respond(if (req.head.method == .GET) b.spec else "{}", .{ .keep_alive = false });
         }
@@ -726,4 +731,691 @@ test "a backend that never answers does not keep den from exiting" {
         if (std.mem.indexOf(u8, text, "no answer within 1s") != null) break;
         sys.sleepMs(20);
     } else return error.Timeout;
+}
+
+// ---------------------------------------------------------------- den upgrade
+
+/// A den started for one test, in its own runtime directory.
+const TestDen = struct {
+    runtime: []u8,
+    name: []const u8,
+    sock: []u8,
+
+    fn start(tag: []const u8, name: []const u8, command: []const []const u8, keep: []const u8) !TestDen {
+        const runtime = try std.fmt.allocPrint(gpa, "/tmp/den-test-{s}{d}", .{ tag, std.c.getpid() });
+        errdefer gpa.free(runtime);
+        try sys.mkdirAll(runtime);
+        try spawnDen(runtime, name, command, keep);
+        return .{ .runtime = runtime, .name = name, .sock = try std.fmt.allocPrint(gpa, "{s}/den/test/{s}.sock", .{ runtime, name }) };
+    }
+
+    /// Stop den if it still runs and remove its directory.
+    fn deinit(d: *TestDen) void {
+        if (sys.connectUnix(d.sock)) |fd| {
+            var k: Conn = .{ .fd = fd };
+            defer k.close();
+            k.send(.shutdown, &.{}) catch {};
+            while (true) _ = k.next() catch break;
+        } else |_| {}
+        std.Io.Dir.cwd().deleteTree(testing.io, d.runtime) catch {};
+        gpa.free(d.sock);
+        gpa.free(d.runtime);
+    }
+
+    /// `den CMD -f SPEC EXTRA...`; caller frees stdout and stderr.
+    fn cli(d: *TestDen, cmd: []const u8, extra: []const []const u8) !std.process.RunResult {
+        const url = try std.fmt.allocPrint(gpa, "file://{s}/{s}.json", .{ d.runtime, d.name });
+        defer gpa.free(url);
+        const state = try std.fmt.allocPrint(gpa, "{s}/state", .{d.runtime});
+        defer gpa.free(state);
+        var env = std.process.Environ.Map.init(gpa);
+        defer env.deinit();
+        try env.put("XDG_RUNTIME_DIR", d.runtime);
+        try env.put("XDG_STATE_HOME", state);
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.appendSlice(gpa, &.{ den_bin, cmd, "-f", url });
+        try argv.appendSlice(gpa, extra);
+        return std.process.run(gpa, testing.io, .{ .argv = argv.items, .environ_map = &env });
+    }
+
+    /// `den upgrade` with the den binary under test; expects it to work.
+    fn upgrade(d: *TestDen) !void {
+        const r = try d.cli("upgrade", &.{});
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        if (!r.term.success()) {
+            std.debug.print("den upgrade: {s}\n", .{r.stderr});
+            return error.UpgradeFailed;
+        }
+        try testing.expect(std.mem.indexOf(u8, r.stdout, ": den ") != null);
+    }
+
+    /// The `status` of the resource; caller deinits.
+    fn status(d: *TestDen) !std.json.Parsed(std.json.Value) {
+        var st = try Conn.open(d.sock);
+        defer st.close();
+        try st.send(.status, &.{});
+        const f = try st.next();
+        try testing.expectEqual(proto.Type.status, f.type);
+        return std.json.parseFromSlice(std.json.Value, gpa, f.payload, .{});
+    }
+
+    fn statusInt(d: *TestDen, field: []const u8) !?i64 {
+        const res = try d.status();
+        defer res.deinit();
+        const v = res.value.object.get("status").?.object.get(field) orelse return null;
+        return v.integer;
+    }
+
+    fn phase(d: *TestDen) ![]const u8 {
+        const res = try d.status();
+        defer res.deinit();
+        const p = res.value.object.get("status").?.object.get("phase").?.string;
+        return if (std.mem.eql(u8, p, "Running")) "Running" else "Exited";
+    }
+
+    fn log(d: *TestDen) ![]u8 {
+        const path = try std.fmt.allocPrint(gpa, "{s}/den/test/{s}.log", .{ d.runtime, d.name });
+        defer gpa.free(path);
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, path, gpa, .limited(1 << 20));
+    }
+
+    fn count(d: *TestDen, needle: []const u8) !usize {
+        const text = try d.log();
+        defer gpa.free(text);
+        return std.mem.count(u8, text, needle);
+    }
+};
+
+/// den_bin as an absolute path, as `upgrade` frames need it.
+fn denPath() ![:0]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(testing.io, den_bin, gpa);
+}
+
+/// Send `upgrade` with `path` on a new connection; returns the reply payload
+/// (u8 ok, then a message). Caller frees.
+fn upgradeFrame(sock: []const u8, path: []const u8) ![]u8 {
+    var u = try Conn.open(sock);
+    defer u.close();
+    // As long as `den upgrade` waits: in Debug builds the terminal library
+    // checks itself on every scroll, so replaying a long scrollback takes
+    // seconds (milliseconds in ReleaseSafe).
+    u.timeout_ms = 30_000;
+    try u.send(.upgrade, &.{path});
+    while (true) {
+        const f = try u.next();
+        if (f.type == .upgrade) return gpa.dupe(u8, f.payload);
+    }
+}
+
+// The main case: the program keeps running, the attached client keeps its
+// connection and screen, and a new client gets the same snapshot as before.
+test "upgrade keeps the program, its screen and its clients" {
+    const script =
+        \\i=0; while [ $i -lt 40 ]; do echo "line $i"; i=$((i+1)); done
+        \\printf '\033]2;my title\007\033[?1049h\033[HALT SCREEN'
+        \\read x
+        \\printf '\033[?1049l'
+        \\echo "after $x"
+        \\read y
+        \\echo "got $y"
+        \\sleep 60
+    ;
+    var d = try TestDen.start("u", "up", &.{ "/bin/sh", "-c", script }, "0s");
+    defer d.deinit();
+
+    var a = try Conn.open(d.sock);
+    defer a.close();
+    try a.attach(80, 24);
+    var term = try newTerm();
+    defer term.deinit(gpa);
+    try a.until(&term, "\"screen\":\"alternate\"");
+    const pid = (try d.statusInt("pid")).?;
+
+    try d.upgrade();
+    try testing.expectEqual(pid, (try d.statusInt("pid")).?);
+    try testing.expectEqualStrings("Running", try d.phase());
+    {
+        const res = try d.status();
+        defer res.deinit();
+        try testing.expectEqualStrings(@import("build_options").version, res.value.object.get("status").?.object.get("denVersion").?.string);
+    }
+    try testing.expectEqual(@as(?i64, 1), try d.statusInt("clients")); // a carried over
+    try testing.expectEqual(1, try d.count("resumed pid="));
+
+    // The client that was attached all along types and sees the result.
+    try a.send(.input, &.{"one\r"});
+    var stream = term.vtStream();
+    defer stream.deinit();
+    while (!try contains(&term, "after one")) {
+        const f = try a.next();
+        try testing.expect(f.type != .snapshot); // no resync needed
+        if (f.type == .output) stream.nextSlice(f.payload[8..]);
+    }
+    try testing.expectEqual(.primary, term.screens.active_key);
+    try testing.expect(try contains(&term, "line 0\n"));
+    try testing.expect(try contains(&term, "line 39\n"));
+
+    // A new client gets everything from the new den.
+    var b = try Conn.open(d.sock);
+    defer b.close();
+    try b.attach(80, 24);
+    var term_b = try newTerm();
+    defer term_b.deinit(gpa);
+    try b.until(&term_b, "\"phase\":\"Running\"");
+    try testing.expect(try contains(&term_b, "line 0\n"));
+    try testing.expect(try contains(&term_b, "after one"));
+    try testing.expect(!try contains(&term_b, "ALT SCREEN"));
+    try testing.expectEqualStrings("my title", term_b.getTitle().?);
+
+    // Again, twice, and `den send` still reaches the program.
+    try d.upgrade();
+    try d.upgrade();
+    try testing.expectEqual(3, try d.count("resumed pid="));
+    const r = try d.cli("send", &.{"two"});
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    try testing.expect(r.term.success());
+    const h = try waitHistory(d.sock, "got two");
+    defer gpa.free(h);
+    try testing.expect(std.mem.startsWith(u8, h, "line 0\nline 1\n"));
+    try testing.expectEqual(pid, (try d.statusInt("pid")).?);
+}
+
+// Output keeps flowing while den upgrades: an attached client gets every
+// byte exactly once, at contiguous offsets, including output the old den had
+// queued for it but not yet sent (the client does not read during the upgrade).
+test "upgrade loses no output while the program writes" {
+    const bin = try denPath();
+    defer gpa.free(bin);
+    var dir_buf: [64]u8 = undefined;
+    const stop = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-stop{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteFile(testing.io, stop) catch {};
+    const script = try std.fmt.allocPrint(gpa, "read x; while [ ! -e {s} ]; do seq 1 1000; done; echo END; sleep 60", .{stop});
+    defer gpa.free(script);
+    var d = try TestDen.start("w", "flood", &.{ "/bin/sh", "-c", script }, "0s");
+    defer d.deinit();
+
+    var a = try Conn.open(d.sock);
+    defer a.close();
+    try a.attach(80, 24);
+    var next_offset: ?u64 = null;
+    while (true) { // the snapshot, then the full state
+        const f = try a.next();
+        if (f.type == .snapshot) next_offset = std.mem.readInt(u64, f.payload[0..8], .little);
+        if (f.type == .event) break;
+    }
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    const Read = struct {
+        fn frame(c: *Conn, off: *?u64, out: *std.ArrayList(u8)) !void {
+            const f = try c.next();
+            switch (f.type) {
+                .snapshot => return error.Resynced,
+                .output => {
+                    const at = std.mem.readInt(u64, f.payload[0..8], .little);
+                    try testing.expectEqual(off.*.?, at);
+                    off.* = at + (f.payload.len - 8);
+                    try out.appendSlice(gpa, f.payload[8..]);
+                },
+                else => {},
+            }
+        }
+    };
+
+    try a.send(.input, &.{"go\r"});
+    while (std.mem.indexOf(u8, got.items, "1000\r\n") == null) try Read.frame(&a, &next_offset, &got);
+    // Upgrade while the program writes and this client reads nothing.
+    const r = try upgradeFrame(d.sock, bin);
+    defer gpa.free(r);
+    try testing.expectEqual(@as(u8, 1), r[0]);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = stop, .data = "" });
+    while (!std.mem.endsWith(u8, got.items, "END\r\n")) try Read.frame(&a, &next_offset, &got);
+
+    // macOS PTYs sometimes write "\r\r\n" for "\n" at 4 KiB boundaries.
+    const plain = got.items[0 .. got.items.len - std.mem.replace(u8, got.items, "\r", "", got.items)];
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    for (1..1001) |i| try block.print(gpa, "{d}\n", .{i});
+    try testing.expect(std.mem.startsWith(u8, plain, "go\n"));
+    try testing.expect(std.mem.endsWith(u8, plain, "END\n"));
+    const blocks = plain["go\n".len .. plain.len - "END\n".len];
+    try testing.expect(blocks.len % block.items.len == 0);
+    try testing.expect(blocks.len / block.items.len >= 2);
+    var it = std.mem.window(u8, blocks, block.items.len, block.items.len);
+    while (it.next()) |b| try testing.expectEqualStrings(block.items, b);
+    try testing.expectEqual(1, try d.count("resumed pid="));
+}
+
+// Input sent while den hands over reaches the program, in order.
+test "input sent during an upgrade is not lost" {
+    const bin = try denPath();
+    defer gpa.free(bin);
+    var d = try TestDen.start("i", "typing", &.{ "/bin/sh", "-c", "while read l; do echo \"got $l\"; done" }, "0s");
+    defer d.deinit();
+    var a = try Conn.open(d.sock);
+    defer a.close();
+    try a.attach(80, 24);
+    var u = try Conn.open(d.sock);
+    defer u.close();
+    try u.send(.upgrade, &.{bin});
+    for (0..50) |i| {
+        var buf: [16]u8 = undefined;
+        try a.send(.input, &.{try std.fmt.bufPrint(&buf, "l{d}\r", .{i})});
+    }
+    while ((try u.next()).type != .upgrade) {}
+    const h = try waitHistory(d.sock, "got l49");
+    defer gpa.free(h);
+    var at: usize = 0;
+    for (0..50) |i| {
+        var buf: [16]u8 = undefined;
+        at = std.mem.indexOfPos(u8, h, at, try std.fmt.bufPrint(&buf, "got l{d}\n", .{i})) orelse return error.Missing;
+    }
+}
+
+// After the program exits, den keeps its final screen in a file; the new
+// den serves it from there and keeps the exit code.
+test "upgrade an exited den" {
+    const script =
+        \\i=0; while [ $i -lt 30 ]; do echo "line $i"; i=$((i+1)); done
+        \\printf '\033]2;done\007'
+        \\exit 4
+    ;
+    var d = try TestDen.start("x", "gone", &.{ "/bin/sh", "-c", script }, "1h");
+    defer d.deinit();
+    for (0..100) |_| {
+        if (try d.statusInt("exitCode") != null) break;
+        sys.sleepMs(50);
+    } else return error.NeverExited;
+    const pid = (try d.statusInt("pid")).?;
+
+    try d.upgrade();
+    try testing.expectEqualStrings("Exited", try d.phase());
+    try testing.expectEqual(@as(?i64, 4), try d.statusInt("exitCode"));
+    try testing.expectEqual(pid, (try d.statusInt("pid")).?);
+
+    var conn = try Conn.open(d.sock);
+    defer conn.close();
+    try conn.attach(80, 24);
+    var term = try newTerm();
+    defer term.deinit(gpa);
+    try conn.until(&term, "\"phase\":\"Exited\"");
+    try testing.expect(try contains(&term, "line 0\n"));
+    try testing.expect(try contains(&term, "line 29"));
+    try testing.expectEqualStrings("done", term.getTitle().?);
+    const h = try history(d.sock);
+    defer gpa.free(h);
+    try testing.expect(std.mem.endsWith(u8, h, "line 29\n"));
+
+    // den delete still cleans up the final screen.
+    const final = try std.fmt.allocPrint(gpa, "{s}/state/den/test/gone.final", .{d.runtime});
+    defer gpa.free(final);
+    try std.Io.Dir.cwd().access(testing.io, final, .{});
+    const r = try d.cli("delete", &.{});
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    try testing.expect(r.term.success());
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, final, .{}));
+}
+
+// keepAfterExit counts from the program's exit, not from the upgrade.
+test "an upgraded den still exits keepAfterExit after the program" {
+    var d = try TestDen.start("k", "brief", &.{ "/bin/sh", "-c", "exit 0" }, "2s");
+    defer d.deinit();
+    for (0..100) |_| {
+        if (try d.statusInt("exitCode") != null) break;
+        sys.sleepMs(20);
+    } else return error.NeverExited;
+    try d.upgrade();
+    for (0..100) |_| {
+        if (sys.connectUnix(d.sock)) |fd| _ = std.c.close(fd) else |_| return; // den is gone
+        sys.sleepMs(50);
+    }
+    return error.DenStayed;
+}
+
+test "upgrade refuses binaries that cannot take over" {
+    var d = try TestDen.start("r", "refuse", &.{ "/bin/sh", "-c", "while read l; do echo \"got $l\"; done" }, "0s");
+    defer d.deinit();
+    const pid = (try d.statusInt("pid")).?;
+    var a = try Conn.open(d.sock);
+    defer a.close();
+    try a.attach(80, 24);
+
+    const cases = [_]struct { path: []const u8, why: []const u8 }{
+        .{ .path = "/bin/echo", .why = "is not a den" },
+        .{ .path = "/nonexistent/den", .why = "is not a den" },
+        .{ .path = "relative/den", .why = "absolute path" },
+        .{ .path = "", .why = "absolute path" },
+    };
+    for (cases) |case| {
+        const r = try upgradeFrame(d.sock, case.path);
+        defer gpa.free(r);
+        try testing.expectEqual(@as(u8, 0), r[0]);
+        if (std.mem.indexOf(u8, r[1..], case.why) == null) {
+            std.debug.print("{s}: {s}\n", .{ case.path, r[1..] });
+            return error.WrongReason;
+        }
+    }
+    // Nothing changed: same den, same program, the client still types.
+    try testing.expectEqual(0, try d.count("resumed pid="));
+    try testing.expectEqual(pid, (try d.statusInt("pid")).?);
+    try a.send(.input, &.{"still\r"});
+    const h = try waitHistory(d.sock, "got still");
+    gpa.free(h);
+    // And a good upgrade after the bad ones works.
+    try d.upgrade();
+    try testing.expectEqual(1, try d.count("resumed pid="));
+}
+
+// If the program is in the middle of an escape sequence, den waits for its
+// end: a new den would read the rest of it as text.
+test "upgrade waits for the end of an escape sequence" {
+    const bin = try denPath();
+    defer gpa.free(bin);
+    const script = "read x; printf '\\033]2;tit'; sleep 1; printf 'le\\007'; echo done; sleep 60";
+    var d = try TestDen.start("e", "esc", &.{ "/bin/sh", "-c", script }, "0s");
+    defer d.deinit();
+    const r = try d.cli("send", &.{"go"});
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    sys.sleepMs(300); // the program has printed the start and sleeps
+
+    var u = try Conn.open(d.sock);
+    defer u.close();
+    const start = std.Io.Clock.awake.now(testing.io).nanoseconds;
+    try u.send(.upgrade, &.{bin});
+    // While it waits, a second upgrade is refused.
+    sys.sleepMs(100);
+    const second = try upgradeFrame(d.sock, bin);
+    defer gpa.free(second);
+    try testing.expectEqual(@as(u8, 0), second[0]);
+    try testing.expect(std.mem.indexOf(u8, second, "already in progress") != null);
+
+    while (true) {
+        const f = try u.next();
+        if (f.type != .upgrade) continue;
+        try testing.expectEqual(@as(u8, 1), f.payload[0]);
+        break;
+    }
+    const waited = std.Io.Clock.awake.now(testing.io).nanoseconds - start;
+    try testing.expect(waited > 400 * std.time.ns_per_ms);
+
+    const h = try waitHistory(d.sock, "done");
+    defer gpa.free(h);
+    try testing.expect(std.mem.indexOf(u8, h, "le") == null);
+    const res = try d.status();
+    defer res.deinit();
+    try testing.expectEqualStrings("title", res.value.object.get("status").?.object.get("title").?.string);
+}
+
+// A program that exits around an upgrade is still reaped by den, with its
+// exit code: den stays its parent through exec.
+test "a program exiting during upgrades keeps its exit code" {
+    const bin = try denPath();
+    defer gpa.free(bin);
+    var d = try TestDen.start("c", "quit", &.{ "/bin/sh", "-c", "sleep 1; exit 7" }, "1h");
+    defer d.deinit();
+    var upgrades: usize = 0;
+    for (0..400) |_| {
+        if (try d.statusInt("exitCode")) |code| {
+            try testing.expectEqual(7, code);
+            break;
+        }
+        const r = try upgradeFrame(d.sock, bin);
+        defer gpa.free(r);
+        try testing.expectEqual(@as(u8, 1), r[0]);
+        upgrades += 1;
+    } else return error.NeverExited;
+    try testing.expect(upgrades > 1);
+}
+
+// The program's parent stays den, and repeated upgrades leave no files open.
+test "upgrades leak no file descriptors" {
+    const bin = try denPath();
+    defer gpa.free(bin);
+    const script = "while read l; do echo \"parent $(ps -o ppid= -p $$ | tr -d ' ')\"; done";
+    var d = try TestDen.start("l", "fds", &.{ "/bin/sh", "-c", script }, "0s");
+    defer d.deinit();
+    var a = try Conn.open(d.sock);
+    defer a.close();
+    try a.attach(80, 24);
+
+    try a.send(.input, &.{"\r"});
+    const h0 = try waitHistory(d.sock, "parent ");
+    defer gpa.free(h0);
+    const den_pid = try parentIn(h0);
+    const before = try waitFds(den_pid, null);
+
+    for (0..5) |_| {
+        const r = try upgradeFrame(d.sock, bin);
+        defer gpa.free(r);
+        try testing.expectEqual(@as(u8, 1), r[0]);
+    }
+    try testing.expectEqual(before, try waitFds(den_pid, before));
+
+    // Still den's child: a new line reports the same parent.
+    try a.send(.input, &.{"\r"});
+    for (0..250) |_| {
+        const h = try history(d.sock);
+        defer gpa.free(h);
+        if (std.mem.count(u8, h, "parent ") == 2) {
+            try testing.expectEqual(den_pid, try parentIn(h[std.mem.lastIndexOf(u8, h, "parent ").?..]));
+            break;
+        }
+        sys.sleepMs(20);
+    } else return error.NoSecondLine;
+}
+
+fn parentIn(h: []const u8) !std.c.pid_t {
+    const at = std.mem.indexOf(u8, h, "parent ").? + "parent ".len;
+    const end = std.mem.indexOfScalarPos(u8, h, at, '\n') orelse h.len;
+    return std.fmt.parseInt(std.c.pid_t, h[at..end], 10);
+}
+
+/// den's open file count once it is stable (connections that just closed
+/// are dropped on den's next round), or once it equals `want`.
+fn waitFds(pid: std.c.pid_t, want: ?usize) !usize {
+    var last = try countFds(pid);
+    for (0..50) |_| {
+        sys.sleepMs(40);
+        const n = try countFds(pid);
+        if (want) |w| if (n == w) return n;
+        if (want == null and n == last) return n;
+        last = n;
+    }
+    return last;
+}
+
+extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, size: c_int) c_int;
+
+fn countFds(pid: std.c.pid_t) !usize {
+    if (@import("builtin").os.tag.isDarwin()) {
+        // PROC_PIDLISTFDS: one 8-byte proc_fdinfo per open file.
+        var buf: [4096]u64 = undefined;
+        const n = proc_pidinfo(pid, 1, 0, &buf, @sizeOf(@TypeOf(buf)));
+        if (n <= 0) return error.ProcPidinfo;
+        return @intCast(@divExact(n, 8));
+    }
+    var path_buf: [64]u8 = undefined;
+    var dir = try std.Io.Dir.cwd().openDir(testing.io, try std.fmt.bufPrint(&path_buf, "/proc/{d}/fd", .{pid}), .{ .iterate = true });
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(testing.io)) |_| n += 1;
+    return n;
+}
+
+// `den attach` in a real terminal does not notice an upgrade.
+test "den attach carries on through an upgrade" {
+    var d = try TestDen.start("t", "att2", &.{ "/bin/sh", "-c", "echo ready; read x; echo \"got $x\"; read y; echo \"then $y\"; sleep 60" }, "0s");
+    defer d.deinit();
+
+    const spec_path = try std.fmt.allocPrintSentinel(gpa, "{s}/att2.json", .{d.runtime}, 0);
+    defer gpa.free(spec_path);
+    const state = try std.fmt.allocPrintSentinel(gpa, "{s}/state", .{d.runtime}, 0);
+    defer gpa.free(state);
+    const rt = try gpa.dupeSentinel(u8, d.runtime, 0);
+    defer gpa.free(rt);
+    const bin = try gpa.dupeSentinel(u8, den_bin, 0);
+    defer gpa.free(bin);
+    const argv = [_:null]?[*:0]const u8{ bin, "attach", "-f", spec_path };
+
+    var master: c_int = undefined;
+    const pid = sys.forkpty(&master, null, null, &.{ .row = 24, .col = 80 });
+    if (pid < 0) return error.ForkptyFailed;
+    if (pid == 0) {
+        _ = sys.setenv("XDG_RUNTIME_DIR", rt, 1);
+        _ = sys.setenv("XDG_STATE_HOME", state, 1);
+        _ = sys.execvp(bin, &argv);
+        std.c._exit(127);
+    }
+    defer _ = std.c.close(master);
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(gpa);
+
+    try readUntil(master, &seen, "\x1b[c");
+    _ = std.c.write(master, "\x1b]11;rgb:1010/2020/3030\x1b\\\x1b[?62c", 30);
+    try readUntil(master, &seen, "ready");
+    _ = std.c.write(master, "hello\r", 6);
+    try readUntil(master, &seen, "got hello");
+
+    try d.upgrade();
+    _ = std.c.write(master, "again\r", 6);
+    try readUntil(master, &seen, "then again");
+    try testing.expect(std.mem.indexOf(u8, seen.items, "den went away") == null);
+    _ = std.c.write(master, "\x1c", 1);
+    try readUntil(master, &seen, "detached");
+    var st: c_int = 0;
+    _ = std.c.waitpid(pid, &st, 0);
+    try testing.expectEqual(@as(c_int, 0), st);
+}
+
+test "den upgrade without a den" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-m{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    var d: TestDen = .{ .runtime = try gpa.dupe(u8, runtime), .name = "none", .sock = try std.fmt.allocPrint(gpa, "{s}/den/test/none.sock", .{runtime}) };
+    defer d.deinit();
+    const spec_path = try std.fmt.allocPrint(gpa, "{s}/none.json", .{runtime});
+    defer gpa.free(spec_path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = spec_path, .data = "{\"metadata\":{\"name\":\"none\",\"namespace\":\"test\"}}" });
+    const r = try d.cli("upgrade", &.{});
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+    try testing.expect(std.mem.indexOf(u8, r.stderr, "test/none is not running") != null);
+}
+
+// Dens started before `den upgrade` existed ignore the request; the CLI
+// sees that from their status and says so at once instead of waiting.
+test "den upgrade refuses a den from before upgrade" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-o{d}", .{std.c.getpid()});
+    const ns_dir = try std.fmt.allocPrint(gpa, "{s}/den/test", .{runtime});
+    defer gpa.free(ns_dir);
+    try sys.mkdirAll(ns_dir);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    const spec_path = try std.fmt.allocPrint(gpa, "{s}/old.json", .{runtime});
+    defer gpa.free(spec_path);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = spec_path, .data = "{\"metadata\":{\"name\":\"old\",\"namespace\":\"test\"}}" });
+    const sock = try std.fmt.allocPrintSentinel(gpa, "{s}/old.sock", .{ns_dir}, 0);
+    defer gpa.free(sock);
+
+    // An old den: answers status without denVersion, ignores anything else.
+    const listen_fd = try sys.listenUnix(sock);
+    defer _ = std.c.close(listen_fd);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("XDG_RUNTIME_DIR", runtime);
+    const start = std.Io.Clock.awake.now(testing.io).nanoseconds;
+    var child = try std.process.spawn(testing.io, .{
+        .argv = &.{ den_bin, "upgrade", "-f", spec_path },
+        .environ_map = &env,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+
+    var pfd = [_]std.posix.pollfd{.{ .fd = listen_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    if (try std.posix.poll(&pfd, 5000) == 0) return error.Timeout;
+    var conn: Conn = .{ .fd = std.c.accept(listen_fd, null, null) };
+    defer conn.close();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    while (true) {
+        var tmp: [4096]u8 = undefined;
+        const n = std.c.read(conn.fd, &tmp, tmp.len);
+        if (n <= 0) break;
+        try got.appendSlice(gpa, tmp[0..@intCast(n)]);
+        const f, _ = try proto.next(got.items, proto.max_client_frame) orelse continue;
+        try testing.expectEqual(proto.Type.status, f.type);
+        try conn.send(.status, &.{"{\"metadata\":{\"name\":\"old\"},\"status\":{\"phase\":\"Running\",\"pid\":1}}"});
+        got.clearRetainingCapacity();
+    }
+    try testing.expectEqual(@as(usize, 0), got.items.len); // no upgrade frame came
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try child.wait(testing.io));
+    try testing.expect(std.Io.Clock.awake.now(testing.io).nanoseconds - start < 5 * std.time.ns_per_s);
+}
+
+// A den read from a URL PATCHes its status there and holds a Lease; the
+// den that takes over carries on with both. Only the new den sees the
+// program exit, so the backend gets exit code 7 only if it does.
+test "an upgraded den keeps reporting its status and its Lease" {
+    const bin = try denPath();
+    defer gpa.free(bin);
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-r{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    const stop = try std.fmt.allocPrint(gpa, "{s}/stop", .{runtime});
+    defer gpa.free(stop);
+
+    const ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const spec_json = try std.fmt.allocPrint(gpa,
+        \\{{"kind":"Den","metadata":{{"name":"reported","namespace":"test","uid":"u2"}},
+        \\ "spec":{{"command":["/bin/sh","-c","while [ ! -e {s} ]; do sleep 0.05; done; exit 7"],"history":{{"keepAfterExit":"0s"}}}}}}
+    , .{stop});
+    defer gpa.free(spec_json);
+    var b: Backend = .{ .server = try ip.listen(testing.io, .{ .reuse_address = true }), .spec = spec_json, .leases = true };
+    defer b.server.deinit(testing.io);
+    defer b.patches.deinit(gpa);
+    defer b.requests.deinit(gpa);
+    defer b.applies.deinit(gpa);
+    const t = try std.Thread.spawn(.{}, Backend.serve, .{&b});
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/dens/reported", .{b.server.socket.address.getPort()});
+    defer gpa.free(url);
+    try apply(runtime, url);
+
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/reported.sock", .{runtime});
+    defer gpa.free(sock);
+    for (0..2) |_| {
+        const r = try upgradeFrame(sock, bin);
+        defer gpa.free(r);
+        try testing.expectEqual(@as(u8, 1), r[0]);
+    }
+    // The new den applies the Lease too.
+    const before = b.applied.load(.acquire);
+    for (0..250) |_| {
+        if (b.applied.load(.acquire) > before) break;
+        sys.sleepMs(20);
+    } else return error.Timeout;
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = stop, .data = "" });
+    t.join();
+
+    // Always the same holder: den's PID does not change.
+    const key = "\"holderIdentity\":\"";
+    const at = std.mem.indexOf(u8, b.applies.items, key).? + key.len;
+    const holder = b.applies.items[at - key.len .. std.mem.indexOfScalarPos(u8, b.applies.items, at, '"').? + 1];
+    try testing.expectEqual(std.mem.count(u8, b.applies.items, key), std.mem.count(u8, b.applies.items, holder));
+
+    try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"status\":{\"phase\":\"Exited\",\"exitCode\":7,") != null);
+    try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"denVersion\":\"") != null);
+    const log_path = try std.fmt.allocPrint(gpa, "{s}/den/test/reported.log", .{runtime});
+    defer gpa.free(log_path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(testing.io, log_path, gpa, .limited(1 << 20));
+    defer gpa.free(text);
+    try testing.expectEqual(2, std.mem.count(u8, text, "resumed pid="));
+    try testing.expect(std.mem.indexOf(u8, text, "PATCH") == null); // no failed PATCH
 }

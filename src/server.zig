@@ -8,6 +8,7 @@ const snapshot = @import("snapshot.zig");
 const queries = @import("queries.zig");
 const sys = @import("sys.zig");
 const fetch = @import("fetch.zig");
+const handoff = @import("handoff.zig");
 
 const c = std.c;
 const fd_t = c.fd_t;
@@ -16,6 +17,16 @@ const log = std.log.scoped(.den);
 /// A client whose unsent output grows past this gets its backlog dropped and
 /// a fresh snapshot instead.
 const max_backlog = 16 << 20;
+
+/// How long `den upgrade` waits for the program to finish an escape
+/// sequence it is in the middle of writing (see Server.quiet).
+const upgrade_wait = 2 * std.time.ns_per_s;
+/// How long a new binary gets to answer `__handoff-version`.
+const probe_timeout_ms = 5000;
+
+/// Colors den answers with until a client describes its own.
+const default_fg: vt.color.RGB = .{ .r = 0xdd, .g = 0xdd, .b = 0xdd };
+const default_bg: vt.color.RGB = .{ .r = 0x1d, .g = 0x1f, .b = 0x21 };
 
 const Client = struct {
     fd: fd_t,
@@ -30,6 +41,8 @@ const Client = struct {
     /// Bytes of `out` already written.
     sent: usize = 0,
     dead: bool = false,
+    /// Sent `upgrade` and waits for the answer.
+    upgrading: bool = false,
 
     fn deinit(cl: *Client, gpa: std.mem.Allocator) void {
         _ = c.close(cl.fd);
@@ -67,7 +80,7 @@ const Pusher = struct {
     const finish_timeout = 1;
 
     fn start(p: *Pusher) !void {
-        p.thread = try std.Thread.spawn(.{}, run, .{p});
+        p.thread = try spawnThread(run, .{p});
     }
 
     /// Queue `json` (owned) in place of anything not yet sent.
@@ -148,6 +161,15 @@ const Pusher = struct {
     }
 };
 
+/// A thread that never takes den's signals, nor do the Io workers it
+/// starts: the main thread blocks them before `den upgrade` execs, and one
+/// a thread handled meanwhile would be lost (sys.blockSignals).
+fn spawnThread(comptime f: anytype, args: anytype) !std.Thread {
+    sys.blockSignals();
+    defer sys.unblockSignals();
+    return std.Thread.spawn(.{}, f, args);
+}
+
 /// Holds a coordination.k8s.io/v1 Lease named after the Den, so the API
 /// server can tell a quiet den from a dead one: renewed every `renew_every`,
 /// it expires `duration` seconds after den stops renewing it. Only on a
@@ -176,7 +198,7 @@ const Leaser = struct {
     const duration = 30;
 
     fn start(l: *Leaser) !void {
-        l.thread = try std.Thread.spawn(.{}, run, .{l});
+        l.thread = try spawnThread(run, .{l});
     }
 
     /// Stop renewing. The thread is left to finish on its own; it may be
@@ -313,6 +335,8 @@ const State = struct {
 pub const Server = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// den's own version, for `upgrade` answers.
+    version: []const u8,
     den: spec.Den,
     /// The resource as read, unknown fields included; `status` replies are
     /// this with the status filled in.
@@ -363,14 +387,86 @@ pub const Server = struct {
     /// serves Leases; null when the spec came from a file.
     api_url: ?[]const u8 = null,
     leaser: ?Leaser = null,
+    /// The binary a client asked den to upgrade to, while den waits for
+    /// a good moment (see `quiet`), until `upgrade_deadline` (monotonic ns).
+    upgrade_path: ?[:0]u8 = null,
+    upgrade_deadline: i96 = 0,
 
     pub fn run(s: *Server) !void {
-        try sys.openSignalPipe();
-        sys.onSignal(.CHLD);
-        sys.onSignal(.TERM);
-        sys.onSignal(.INT);
-
+        try handleSignals();
         s.size = .{ .cols = s.den.spec.size.cols, .rows = s.den.spec.size.rows };
+        try s.initTerminal("");
+        defer s.freeTerminal();
+
+        try s.spawn();
+        log.info("running pid={d} socket={s}", .{ s.pid, s.socket_path });
+        try s.serve();
+    }
+
+    /// Carry on where the den that exec'd us (`den upgrade`) left off; see
+    /// handoff.zig. The fields set by main (paths, listen_fd) come from it too.
+    pub fn resumeFrom(s: *Server, st: handoff.State) !void {
+        const h = st.header;
+        try handleSignals();
+        s.pid = h.pid;
+        s.master = h.master;
+        s.offset = h.offset;
+        s.size = .{ .cols = h.cols, .rows = h.rows };
+        s.cell_width = h.cell_width;
+        s.cell_height = h.cell_height;
+        s.next_seq = h.next_seq;
+        s.exit_at = if (h.exit_at) |t| t else null;
+        s.last_output = if (h.last_output) |t| t else null;
+        s.state = .{
+            .title = try s.gpa.dupe(u8, h.title),
+            .cwd = try s.gpa.dupe(u8, h.cwd),
+            .alternate = h.alternate,
+            .exit_code = h.exit_code,
+        };
+        if (h.live) {
+            try s.initTerminal(st.snapshot);
+            if (h.fg) |v| s.term.colors.foreground.default = .{ .r = v[0], .g = v[1], .b = v[2] };
+            if (h.bg) |v| s.term.colors.background.default = .{ .r = v[0], .g = v[1], .b = v[2] };
+        }
+        defer s.freeTerminal();
+        try s.pty_in.appendSlice(s.gpa, st.pty_in);
+        for (h.clients, st.client_in, st.client_out) |hc, in, out| {
+            const cl = try s.gpa.create(Client);
+            cl.* = .{
+                .fd = hc.fd,
+                .attached = hc.attached,
+                .rw = hc.rw,
+                .size = .{ .cols = hc.cols, .rows = hc.rows },
+                .seq = hc.seq,
+                .upgrading = hc.upgrading,
+            };
+            try s.clients.append(s.gpa, cl);
+            try cl.in.appendSlice(s.gpa, in);
+            try cl.out.appendSlice(s.gpa, out);
+        }
+        // Inherited files are closed on our own next exec again.
+        sys.setCloexec(s.listen_fd);
+        if (s.master >= 0) sys.setCloexec(s.master);
+        for (s.clients.items) |cl| sys.setCloexec(cl.fd);
+
+        // The old den blocked its signals before exec; the ones that came
+        // since are delivered now. A SIGCHLD it had taken but not handled
+        // yet is lost with its pipe, so check on the program anyway.
+        sys.unblockSignals();
+        sys.requeue(.{ .chld = true });
+        log.info("resumed pid={d} from den {s}; now den {s}", .{ s.pid, h.from, s.version });
+        for (s.clients.items) |cl| if (cl.upgrading) s.replyUpgrade(cl, true, s.version);
+        try s.serve();
+    }
+
+    fn handleSignals() !void {
+        try sys.openSignalPipe();
+        for (sys.den_signals) |sig| sys.onSignal(sig);
+    }
+
+    /// The emulator at `s.size`. `snap`, a handoff snapshot, restores the
+    /// screens an earlier den had.
+    fn initTerminal(s: *Server, snap: []const u8) !void {
         s.term = try vt.Terminal.init(s.io, s.gpa, .{
             .cols = s.size.cols,
             .rows = s.size.rows,
@@ -382,19 +478,25 @@ pub const Server = struct {
         // them, and clients never see them (queries.zig). These colors are
         // used until a client tells den its own; snapshots only replay
         // colors a program set, so these never reach clients.
-        s.term.colors.foreground = .init(.{ .r = 0xdd, .g = 0xdd, .b = 0xdd });
-        s.term.colors.background = .init(.{ .r = 0x1d, .g = 0x1f, .b = 0x21 });
+        s.term.colors.foreground = .init(default_fg);
+        s.term.colors.background = .init(default_bg);
+        if (snap.len > 0) {
+            // Through a stream that answers nothing: these bytes are not
+            // the program's, and must not reach it.
+            var replay = s.term.vtStream();
+            defer replay.deinit();
+            replay.nextSlice(snap);
+        }
         s.stream = s.term.vtStream();
         s.stream.handler.effects.write_pty = &answer;
         s.stream.handler.effects.device_attributes = &deviceAttributes;
         s.stream.handler.effects.color_scheme = &colorScheme;
         s.stream.handler.effects.size = &sizeReport;
         s.live = true;
-        defer s.freeTerminal();
+    }
 
-        try s.spawn();
-        log.info("running pid={d} socket={s}", .{ s.pid, s.socket_path });
-        // Never freed: the Leaser thread may outlive run() by a moment.
+    fn serve(s: *Server) !void {
+        // Never freed: the Leaser thread may outlive serve() by a moment.
         var lease_strings: std.heap.ArenaAllocator = .init(s.gpa);
         if (s.api_url) |base| {
             const a = lease_strings.allocator();
@@ -419,7 +521,6 @@ pub const Server = struct {
         }
         // Then after every round: whatever changes the status wakes poll.
         try s.pushStatus();
-
         while (try s.tick()) try s.pushStatus();
 
         // Clean up before hanging up on clients, so a client that sees den
@@ -457,7 +558,7 @@ pub const Server = struct {
     /// file until den exits. If the file cannot be written, the emulator
     /// stays and serves them as before.
     fn freeze(s: *Server) void {
-        const snap = snapshot.encode(s.gpa, &s.term) catch |err| {
+        const snap = snapshot.encode(s.gpa, &s.term, .client) catch |err| {
             log.warn("final snapshot: {s}; keeping the terminal in memory", .{@errorName(err)});
             return;
         };
@@ -511,6 +612,8 @@ pub const Server = struct {
         s.master = master;
         s.pid = pid;
         try sys.setNonblock(master);
+        // Nothing den runs itself may hold the PTY (handoff.probe).
+        sys.setCloexec(master);
         if (spec_.paused) _ = c.kill(-pid, .STOP);
     }
 
@@ -537,7 +640,11 @@ pub const Server = struct {
         if (s.exit_at) |at| {
             const left = at - s.now();
             if (left <= 0) return false;
-            timeout = @intCast(@min(@divTrunc(left, std.time.ns_per_ms) + 1, std.math.maxInt(i32)));
+            timeout = msUntil(left);
+        }
+        if (s.upgrade_path != null) {
+            const t = msUntil(s.upgrade_deadline - s.now());
+            timeout = if (timeout < 0) t else @min(timeout, t);
         }
         _ = try std.posix.poll(fds.items, timeout);
 
@@ -559,7 +666,158 @@ pub const Server = struct {
             return false;
         }
         try s.reap();
+        if (s.upgrade_path != null and (s.quiet() or s.now() >= s.upgrade_deadline)) s.upgrade();
         return true;
+    }
+
+    /// Poll timeout for `left` ns, rounded up.
+    fn msUntil(left: i96) i32 {
+        if (left <= 0) return 0;
+        return @intCast(@min(@divTrunc(left, std.time.ns_per_ms) + 1, std.math.maxInt(i32)));
+    }
+
+    /// Whether den is between escape sequences. The emulator's parser and
+    /// the query filter keep what they have seen of an unfinished one in
+    /// memory, which an upgrade would lose: the new den would read the
+    /// rest of it as text.
+    fn quiet(s: *Server) bool {
+        return !s.live or (s.stream.ground() and s.filter.state == .ground);
+    }
+
+    /// Replace this den with the binary a client asked for (handoff.zig).
+    /// Returns only if that failed, after telling the client why.
+    fn upgrade(s: *Server) void {
+        const path = s.upgrade_path.?;
+        defer {
+            s.gpa.free(path);
+            s.upgrade_path = null;
+        }
+        const err = if (s.execNew(path)) |_| unreachable else |e| e;
+        var buf: [600]u8 = undefined;
+        const msg = switch (err) {
+            error.NotDen => std.fmt.bufPrint(&buf, "{s} is not a den that can take over from den {s}", .{ path, s.version }),
+            error.Timeout => std.fmt.bufPrint(&buf, "{s} did not answer __handoff-version", .{path}),
+            error.Stopping => std.fmt.bufPrint(&buf, "den is stopping", .{}),
+            else => std.fmt.bufPrint(&buf, "{s}: {s}", .{ path, @errorName(err) }),
+        } catch "upgrade failed";
+        log.warn("upgrade: {s}", .{msg});
+        for (s.clients.items) |cl| if (cl.upgrading) s.replyUpgrade(cl, false, msg);
+    }
+
+    fn replyUpgrade(s: *Server, cl: *Client, ok: bool, msg: []const u8) void {
+        cl.upgrading = false;
+        proto.append(s.gpa, &cl.out, .upgrade, &.{ &.{@intFromBool(ok)}, msg }) catch {
+            cl.dead = true;
+            return;
+        };
+        s.flush(cl);
+    }
+
+    /// Exec `path` with our state; returns only on failure, with everything
+    /// as it was.
+    fn execNew(s: *Server, path: [:0]const u8) !noreturn {
+        if (!s.quiet()) log.warn("upgrade: the program is in the middle of an escape sequence; the new den may show its end as text", .{});
+        try handoff.probe(path, probe_timeout_ms);
+        // Less to carry over.
+        for (s.clients.items) |cl| if (!cl.dead) s.flush(cl);
+
+        // From here until the new den is ready, signals wait. One that
+        // already came and is still in the pipe goes back in on failure.
+        sys.blockSignals();
+        const got = sys.drainSignalPipe();
+        errdefer {
+            sys.requeue(got);
+            sys.unblockSignals();
+        }
+        if (got.term) return error.Stopping;
+
+        const state = try s.encodeState();
+        defer s.gpa.free(state);
+        const state_path = try std.fmt.allocPrintSentinel(s.gpa, "{s}.handoff", .{s.final_path[0 .. s.final_path.len - ".final".len]}, 0);
+        defer s.gpa.free(state_path);
+        const state_fd = try handoff.writeUnlinked(state_path, state);
+        defer _ = c.close(state_fd);
+
+        // The files the new den takes over.
+        var keep: std.ArrayList(fd_t) = .empty;
+        defer keep.deinit(s.gpa);
+        try keep.appendSlice(s.gpa, &.{ s.listen_fd, state_fd });
+        if (s.master >= 0) try keep.append(s.gpa, s.master);
+        for (s.clients.items) |cl| if (!cl.dead) try keep.append(s.gpa, cl.fd);
+        for (keep.items) |fd| sys.clearCloexec(fd);
+        defer for (keep.items) |fd| sys.setCloexec(fd);
+
+        var fd_buf: [16]u8 = undefined;
+        const fd_arg = try std.fmt.bufPrintSentinel(&fd_buf, "{d}", .{state_fd}, 0);
+        const argv = [_:null]?[*:0]const u8{ path, "__resume", fd_arg };
+        log.info("upgrade: exec {s} ({d} bytes of state)", .{ path, state.len });
+        _ = sys.execve(path, &argv, @ptrCast(c.environ));
+        log.warn("upgrade: exec {s}: errno {d}", .{ path, @backingInt(c.errno(@as(c_int, -1))) });
+        return error.ExecFailed;
+    }
+
+    /// What the new den needs to carry on (handoff.State), encoded.
+    fn encodeState(s: *Server) ![]u8 {
+        var arena: std.heap.ArenaAllocator = .init(s.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var clients: std.ArrayList(handoff.Client) = .empty;
+        var ins: std.ArrayList([]const u8) = .empty;
+        var outs: std.ArrayList([]const u8) = .empty;
+        for (s.clients.items) |cl| if (!cl.dead) {
+            try clients.append(a, .{
+                .fd = cl.fd,
+                .attached = cl.attached,
+                .rw = cl.rw,
+                .cols = cl.size.cols,
+                .rows = cl.size.rows,
+                .seq = cl.seq,
+                .upgrading = cl.upgrading,
+            });
+            try ins.append(a, cl.in.items);
+            try outs.append(a, cl.out.items[cl.sent..]);
+        };
+        return handoff.encode(s.gpa, .{
+            .header = .{
+                .from = s.version,
+                .resource = s.resource,
+                .socket_path = s.socket_path,
+                .final_path = s.final_path,
+                .log_path = s.log_path,
+                .status_url = s.status_url,
+                .unix_socket = s.unix_socket,
+                .status_interval = s.status_interval,
+                .api_url = s.api_url,
+                .listen_fd = s.listen_fd,
+                .master = s.master,
+                .pid = s.pid,
+                .live = s.live,
+                .offset = s.offset,
+                .cols = s.size.cols,
+                .rows = s.size.rows,
+                .cell_width = s.cell_width,
+                .cell_height = s.cell_height,
+                .fg = if (s.live) rgb(s.term.colors.foreground.default) else null,
+                .bg = if (s.live) rgb(s.term.colors.background.default) else null,
+                .next_seq = s.next_seq,
+                .title = s.state.title,
+                .cwd = s.state.cwd,
+                .alternate = s.state.alternate,
+                .exit_code = s.state.exit_code,
+                .exit_at = if (s.exit_at) |t| @intCast(t) else null,
+                .last_output = if (s.last_output) |t| @intCast(t) else null,
+                .clients = clients.items,
+            },
+            .snapshot = if (s.live) try snapshot.encode(a, &s.term, .handoff) else "",
+            .pty_in = s.pty_in.items,
+            .client_in = ins.items,
+            .client_out = outs.items,
+        });
+    }
+
+    fn rgb(v: ?vt.color.RGB) ?[3]u8 {
+        const x = v orelse return null;
+        return .{ x.r, x.g, x.b };
     }
 
     fn now(s: *Server) i96 {
@@ -793,6 +1051,16 @@ pub const Server = struct {
                 s.flush(cl);
             },
             .shutdown => s.stopping = true,
+            .upgrade => {
+                const path = f.payload;
+                if (s.upgrade_path != null) return s.replyUpgrade(cl, false, "an upgrade is already in progress");
+                if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null)
+                    return s.replyUpgrade(cl, false, "upgrade needs the absolute path of a den binary");
+                s.upgrade_path = try s.gpa.dupeSentinel(u8, path, 0);
+                s.upgrade_deadline = s.now() + upgrade_wait;
+                cl.upgrading = true;
+                log.info("upgrade to {s} requested", .{path});
+            },
             .history => {
                 const color = f.payload.len > 0 and f.payload[0] & 1 != 0;
                 const txt = try s.historyText(color);
@@ -834,7 +1102,7 @@ pub const Server = struct {
 
     fn sendSnapshot(s: *Server, cl: *Client) !void {
         const snap = if (s.live)
-            try snapshot.encode(s.gpa, &s.term)
+            try snapshot.encode(s.gpa, &s.term, .client)
         else
             try std.Io.Dir.cwd().readFileAlloc(s.io, s.final_path, s.gpa, .unlimited);
         defer s.gpa.free(snap);
@@ -903,6 +1171,7 @@ pub const Server = struct {
             .cwd = st.cwd.?,
             .lastOutputTime = last,
             .observedGeneration = if (s.den.metadata.generation != 0) s.den.metadata.generation else null,
+            .denVersion = s.version,
         };
         if (patch) {
             const uid = s.den.metadata.uid;

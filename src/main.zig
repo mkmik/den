@@ -3,6 +3,7 @@
 //!     den apply -f den.yaml
 //!     den get -f den.yaml
 //!     den attach -f den.yaml
+//!     den upgrade -f den.yaml
 //!     den delete -f den.yaml
 //!
 //! `apply` loads the spec, opens the control socket, prints the socket path,
@@ -16,9 +17,10 @@ const Server = @import("server.zig").Server;
 const proto = @import("proto.zig");
 const yaml = @import("yaml.zig");
 const fetch = @import("fetch.zig");
+const handoff = @import("handoff.zig");
 
 const version = @import("build_options").version;
-const usage = "usage: den apply|attach|get|logs|send|delete -f den.yaml [--unix-socket PATH] [--status-interval 5s] [-o yaml|json] [--color] [-n] [TEXT...]\n";
+const usage = "usage: den apply|attach|get|logs|send|upgrade|delete -f den.yaml [--unix-socket PATH] [--status-interval 5s] [-o yaml|json] [--color] [-n] [TEXT...]\n";
 const help =
     \\usage: den <command> [options]
     \\
@@ -39,6 +41,8 @@ const help =
     \\                      type TEXT into the program, words joined by
     \\                      spaces, then Enter (-n: no Enter). Without TEXT,
     \\                      send stdin as is
+    \\  upgrade -f FILE     replace the running den with this den binary; the
+    \\                      program, its screen and attached clients carry on
     \\  delete -f FILE      stop the program (SIGHUP, SIGKILL after 5s) and den
     \\  version             print the version (also --version)
     \\  help                show this help (also -h, --help)
@@ -62,7 +66,7 @@ const help =
     \\
 ;
 
-const Command = enum { apply, attach, get, logs, send, delete };
+const Command = enum { apply, attach, get, logs, send, upgrade, delete };
 const Format = enum { yaml, json };
 
 pub fn main(init: std.process.Init) !void {
@@ -75,6 +79,10 @@ pub fn main(init: std.process.Init) !void {
     const arg0 = args.next() orelse fatal(help, .{});
     if (isHelp(arg0) or std.mem.eql(u8, arg0, "help")) return out(help);
     if (std.mem.eql(u8, arg0, "version") or std.mem.eql(u8, arg0, "--version")) return out("den " ++ version ++ "\n");
+    // What `den upgrade` runs: the old den asks what it can hand over,
+    // then execs us with it (handoff.zig).
+    if (std.mem.eql(u8, arg0, "__handoff-version")) return out(handoff.version_line);
+    if (std.mem.eql(u8, arg0, "__resume")) return resumeDen(gpa, arena, io, args.next() orelse fatal(usage, .{}));
     const cmd = std.meta.stringToEnum(Command, arg0) orelse fatal("den: unknown command {s}\n" ++ help, .{arg0});
 
     var spec_opt: ?[]const u8 = null;
@@ -138,6 +146,7 @@ pub fn main(init: std.process.Init) !void {
             if (text != null and enter) try data.append(arena, '\r');
             return send(arena, den, socket_path, data.items);
         },
+        .upgrade => return upgrade(arena, io, den, socket_path),
         .delete => return delete(arena, den, socket_path),
     }
 
@@ -165,6 +174,7 @@ pub fn main(init: std.process.Init) !void {
     var server: Server = .{
         .gpa = gpa,
         .io = threaded.io(),
+        .version = version,
         .den = den,
         .resource = resource,
         .socket_path = socket_path,
@@ -184,6 +194,65 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     std.process.exit(0);
+}
+
+/// The den process after `den upgrade` exec'd it: read the state the old
+/// den left on `fd_arg` and carry on. stdout and stderr are already den's log.
+fn resumeDen(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, fd_arg: []const u8) !void {
+    const fd = std.fmt.parseInt(std.c.fd_t, fd_arg, 10) catch fatal("den: __resume needs a file descriptor\n", .{});
+    sys.ignoreSigpipe(); // exec kept it ignored; be sure
+    const bytes = handoff.readAllAndClose(arena, fd) catch |err| resumeFailed(err);
+    const st = handoff.decode(arena, bytes) catch |err| resumeFailed(err);
+    const h = st.header;
+    const den = spec.parse(arena, h.resource) catch |err| resumeFailed(err);
+    var server: Server = .{
+        .gpa = gpa,
+        .io = io,
+        .version = version,
+        .den = den,
+        .resource = h.resource,
+        .socket_path = try arena.dupeSentinel(u8, h.socket_path, 0),
+        .final_path = try arena.dupeSentinel(u8, h.final_path, 0),
+        .log_path = try arena.dupeSentinel(u8, h.log_path, 0),
+        .listen_fd = h.listen_fd,
+        .size = undefined,
+        .status_url = h.status_url,
+        .unix_socket = h.unix_socket,
+        .status_interval = h.status_interval,
+        .api_url = h.api_url,
+    };
+    server.resumeFrom(st) catch |err| {
+        _ = std.c.unlink(server.socket_path);
+        _ = std.c.unlink(server.final_path);
+        resumeFailed(err);
+    };
+    std.process.exit(0); // as after apply: don't wait for the pusher
+}
+
+/// The program loses its den: when we exit, its PTY hangs up.
+fn resumeFailed(err: anyerror) noreturn {
+    std.log.err("den: resuming after upgrade: {s}", .{@errorName(err)});
+    std.process.exit(1);
+}
+
+/// Replace the running den with this binary.
+fn upgrade(a: std.mem.Allocator, io: std.Io, den: spec.Den, socket_path: [:0]const u8) !void {
+    const self = std.process.executablePathAlloc(io, a) catch |err|
+        fail("den: finding this den binary: {s}\n", .{@errorName(err)});
+    // A den from before `den upgrade` would ignore the request: ask first.
+    const fd = request(den, socket_path, .status, &.{});
+    const st = try reply(a, fd, socket_path, .status, 5000);
+    const resource = try std.json.parseFromSliceLeaky(std.json.Value, a, st.payload, .{});
+    const old = resource.object.get("status").?.object.get("denVersion") orelse
+        fail("den: {s}/{s} runs a den from before `den upgrade`.\n" ++
+            "Restart it instead: den delete -f FILE, then den apply -f FILE\n", .{ den.metadata.namespace, den.metadata.name });
+    writeFrame(fd, socket_path, .upgrade, self);
+    // The old den checks the binary, waits for the program to finish an
+    // escape sequence, then the new one reads the state: allow for all.
+    const f = try reply(a, fd, socket_path, .upgrade, 30_000);
+    if (f.payload.len == 0) fail("den: empty upgrade reply\n", .{});
+    if (f.payload[0] != 1) fail("den: upgrade failed: {s}\n", .{f.payload[1..]});
+    out(try std.fmt.allocPrint(a, "{s}/{s}: den {s} -> {s}\n", .{ den.metadata.namespace, den.metadata.name, old.string, f.payload[1..] }));
 }
 
 /// Connect to the den for `den` and send it one frame.
@@ -236,9 +305,9 @@ fn readFrame(a: std.mem.Allocator, fd: std.c.fd_t, buf: *std.ArrayList(u8), time
 
 /// The answer to a status or history request. A den built before that
 /// request existed ignores it, so silence means "restart that den".
-fn reply(a: std.mem.Allocator, fd: std.c.fd_t, socket_path: []const u8, want: proto.Type) !proto.Frame {
+fn reply(a: std.mem.Allocator, fd: std.c.fd_t, socket_path: []const u8, want: proto.Type, timeout_ms: i32) !proto.Frame {
     var buf: std.ArrayList(u8) = .empty;
-    const f = readFrame(a, fd, &buf, 5000) catch |err| switch (err) {
+    const f = readFrame(a, fd, &buf, timeout_ms) catch |err| switch (err) {
         error.Timeout => null,
         else => return err,
     };
@@ -250,7 +319,7 @@ fn reply(a: std.mem.Allocator, fd: std.c.fd_t, socket_path: []const u8, want: pr
 /// Print the resource den runs, with its status, as YAML or JSON.
 fn get(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, format: Format) !void {
     const fd = request(den, socket_path, .status, &.{});
-    const f = try reply(a, fd, socket_path, .status);
+    const f = try reply(a, fd, socket_path, .status, 5000);
     const resource = try std.json.parseFromSliceLeaky(std.json.Value, a, f.payload, .{});
     var w: std.Io.Writer.Allocating = .init(a);
     switch (format) {
@@ -266,7 +335,7 @@ fn get(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, format: F
 /// Print the scrollback and screen as text.
 fn logs(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, color: bool) !void {
     const fd = request(den, socket_path, .history, &.{@intFromBool(color)});
-    const f = try reply(a, fd, socket_path, .history);
+    const f = try reply(a, fd, socket_path, .history, 5000);
     var rest = f.payload;
     while (rest.len > 0) {
         const n = std.c.write(1, rest.ptr, rest.len);
@@ -287,7 +356,7 @@ fn send(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, data: []
         rest = rest[n..];
     }
     writeFrame(fd, socket_path, .status, &.{});
-    const f = try reply(a, fd, socket_path, .status);
+    const f = try reply(a, fd, socket_path, .status, 5000);
     const resource = try std.json.parseFromSliceLeaky(std.json.Value, a, f.payload, .{});
     const phase = resource.object.get("status").?.object.get("phase").?.string;
     if (!std.mem.eql(u8, phase, "Running")) fail("den: the program has exited; input dropped\n", .{});
@@ -609,5 +678,6 @@ test {
     _ = @import("fetch.zig");
     _ = @import("queries.zig");
     _ = @import("server.zig");
+    _ = @import("handoff.zig");
     _ = @import("e2e_test.zig");
 }
