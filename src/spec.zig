@@ -41,7 +41,7 @@ pub const History = struct {
 };
 
 /// What den reports about itself: the resource's `status`. `den get`
-/// prints it and milestone 4 PATCHes the same thing to the backend.
+/// prints it, and den PATCHes it to the URL its spec came from.
 pub const Status = struct {
     /// Running | Exited (Pending and Failed come with the backend).
     phase: []const u8,
@@ -59,6 +59,8 @@ pub const Status = struct {
     cwd: []const u8,
     /// RFC 3339, UTC. Absent until the program writes something.
     lastOutputTime: ?[]const u8 = null,
+    /// metadata.generation of the spec den runs, when it has one.
+    observedGeneration: ?i64 = null,
 };
 
 /// The resource as read (unknown fields kept), with `status` set, as JSON.

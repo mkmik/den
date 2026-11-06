@@ -18,7 +18,7 @@ const yaml = @import("yaml.zig");
 const fetch = @import("fetch.zig");
 
 const version = @import("build_options").version;
-const usage = "usage: den apply|attach|get|logs|send|delete -f den.yaml [--unix-socket PATH] [-o yaml|json] [--color] [-n] [TEXT...]\n";
+const usage = "usage: den apply|attach|get|logs|send|delete -f den.yaml [--unix-socket PATH] [--status-interval 5s] [-o yaml|json] [--color] [-n] [TEXT...]\n";
 const help =
     \\usage: den <command> [options]
     \\
@@ -47,9 +47,13 @@ const help =
     \\file:///absolute/path, http://..., https://..., or
     \\http+unix://%2Fpath%2Fto.sock/url/path for HTTP over the Unix
     \\socket /path/to.sock. It must answer 2xx; den reads at most 1 MiB.
+    \\With an HTTP URL, den PATCHes its status to URL/status (a JSON
+    \\merge patch, like a Kubernetes status subresource) as it changes.
     \\--unix-socket PATH  fetch the http:// URL in FILE over the Unix socket
     \\                    PATH, like curl; the URL's host is only the Host
     \\                    header
+    \\--status-interval D  (apply) at most one status PATCH per D, and the
+    \\                    retry delay (default 5s; units ms, s, m, h)
     \\apply prints the control socket path and goes into the background,
     \\logging to <name>.log next to the socket. The socket is
     \\$XDG_RUNTIME_DIR/den/<namespace>/<name>.sock, or
@@ -75,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
 
     var spec_opt: ?[]const u8 = null;
     var unix_socket: ?[]const u8 = null;
+    var status_interval: ?u64 = null;
     var format: ?Format = null;
     var color = false;
     var enter = true;
@@ -95,6 +100,9 @@ pub fn main(init: std.process.Init) !void {
             spec_opt = args.next() orelse fatal(usage, .{});
         } else if (std.mem.eql(u8, arg, "--unix-socket")) {
             unix_socket = args.next() orelse fatal(usage, .{});
+        } else if (std.mem.eql(u8, arg, "--status-interval")) {
+            const d = args.next() orelse fatal(usage, .{});
+            status_interval = spec.parseDuration(d) catch fatal("den: bad --status-interval: {s}\n", .{d});
         } else if (std.mem.eql(u8, arg, "--color")) {
             color = true;
         } else if (std.mem.eql(u8, arg, "-o")) {
@@ -105,6 +113,7 @@ pub fn main(init: std.process.Init) !void {
     const path = spec_opt orelse fatal(usage, .{});
     if (format != null and cmd != .get) fatal("den: -o only applies to get\n", .{});
     if (color and cmd != .logs) fatal("den: --color only applies to logs\n", .{});
+    if (status_interval != null and cmd != .apply) fatal("den: --status-interval only applies to apply\n", .{});
 
     var status: std.http.Status = .ok;
     const bytes = fetch.read(gpa, arena, io, path, unix_socket, &status) catch |err| switch (err) {
@@ -148,10 +157,14 @@ pub fn main(init: std.process.Init) !void {
 
     sys.ignoreSigpipe();
     daemonize(log_fd);
+    // The worker threads of `io` did not survive the fork: anything handed
+    // to them (connecting to a host is) would wait forever, and so would
+    // returning from main, which waits for them. Hence a fresh Io, and exit.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
 
     var server: Server = .{
         .gpa = gpa,
-        .io = io,
+        .io = threaded.io(),
         .den = den,
         .resource = resource,
         .socket_path = socket_path,
@@ -159,6 +172,9 @@ pub fn main(init: std.process.Init) !void {
         .log_path = log_path,
         .listen_fd = listen_fd,
         .size = undefined,
+        .status_url = fetch.statusUrl(arena, path) catch null,
+        .unix_socket = unix_socket,
+        .status_interval = status_interval orelse 5 * std.time.ns_per_s,
     };
     server.run() catch |err| {
         _ = std.c.unlink(socket_path);
@@ -166,6 +182,7 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("den: {s}", .{@errorName(err)});
         std.process.exit(1);
     };
+    std.process.exit(0);
 }
 
 /// Connect to the den for `den` and send it one frame.
