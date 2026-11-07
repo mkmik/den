@@ -510,13 +510,14 @@ fn readUntil(fd: std.c.fd_t, seen: *std.ArrayList(u8), needle: []const u8) !void
     }
 }
 
-// The program sees DEN_SOCKET, so `den attach` run inside it refuses.
-test "attach inside a den refuses" {
+// The program sees DEN_SOCKET, so `den attach` run inside it refuses, and
+// `den get` with no -f describes that den, including where its spec came from.
+test "attach inside a den refuses; get finds it" {
     var dir_buf: [64]u8 = undefined;
     const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-n{d}", .{std.c.getpid()});
     try sys.mkdirAll(runtime);
     defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
-    const script = try std.fmt.allocPrint(gpa, "echo \"in $DEN_SOCKET\"; {s} attach -f {s}/nest.json; echo \"exit $?\"; sleep 60", .{ den_bin, runtime });
+    const script = try std.fmt.allocPrint(gpa, "echo \"in $DEN_SOCKET\"; {s} attach -f {s}/nest.json; echo \"exit $?\"; {s} get -o json; sleep 60", .{ den_bin, runtime, den_bin });
     defer gpa.free(script);
     try spawnDen(runtime, "nest", &.{ "/bin/sh", "-c", script }, "0s");
     const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/nest.sock", .{runtime});
@@ -528,8 +529,11 @@ test "attach inside a den refuses" {
         while (true) _ = k.next() catch break;
     } else |_| {};
 
-    const h = try waitHistory(sock, "exit 2");
+    const source = try std.fmt.allocPrint(gpa, "\"url\": \"file://{s}/nest.json\"", .{runtime});
+    defer gpa.free(source);
+    const h = try waitHistory(sock, source);
     defer gpa.free(h);
+    try testing.expect(std.mem.indexOf(u8, h, "exit 2") != null);
     const in = try std.fmt.allocPrint(gpa, "in {s}", .{sock});
     defer gpa.free(in);
     try testing.expect(std.mem.indexOf(u8, h, in) != null);
@@ -617,7 +621,9 @@ test "a den read from a URL PATCHes its status there" {
     try testing.expectEqual(0, b.applies.items.len);
     try testing.expect(std.mem.startsWith(u8, b.patches.items, "{\"metadata\":{\"uid\":\"u1\"},\"status\":{\"phase\":\"Running\""));
     try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"status\":{\"phase\":\"Exited\",\"exitCode\":7,") != null);
-    try testing.expect(std.mem.indexOf(u8, b.patches.items, "\"observedGeneration\":3}}\n") != null);
+    const source = try std.fmt.allocPrint(gpa, "\"observedGeneration\":3,\"source\":{{\"url\":\"{s}\"}}}}}}\n", .{url});
+    defer gpa.free(source);
+    try testing.expect(std.mem.indexOf(u8, b.patches.items, source) != null);
 }
 
 test "a den on a server that serves Leases holds one" {

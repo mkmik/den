@@ -63,6 +63,19 @@ that come the variables named in `inheritEnv`, copied from the environment
 `TERM=xterm-256color` and `DEN_SOCKET`, then `env`. den passes nothing through on its own:
 which variables to inherit is up to whatever writes the spec.
 
+Inside a den, `den get` needs no `-f`: it asks the den at `DEN_SOCKET`. Its
+`status.source` says where that den's spec came from, so a program can find
+the API server (such as dennet) that runs it:
+
+    $ den get -o json | jq .status.source
+    {
+      "url": "http://dennet/apis/den.mkm.pub/v1alpha1/namespaces/default/dens/build",
+      "unixSocket": "/home/marko/.local/state/dennet/dennet.sock"
+    }
+
+`url` is the `-f` den was started with (a relative path made absolute) and
+`unixSocket` the `--unix-socket`, when given.
+
 `-f` (`--filename`) takes a path, absolute or relative, or a URL:
 
     den apply -f den.yaml

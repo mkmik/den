@@ -31,7 +31,9 @@ const help =
     \\                      Ctrl-\ detaches, the program keeps running.
     \\                      Refused inside a den (DEN_SOCKET is set)
     \\  get -f FILE         print the resource with its status filled in
-    \\                      (-o yaml, the default, or -o json)
+    \\                      (-o yaml, the default, or -o json). Inside a
+    \\                      den, -f can be left out: the den at DEN_SOCKET.
+    \\                      status.source says where its spec came from
     \\  logs -f FILE
     \\                      print the scrollback and screen as text (--color
     \\                      keeps colors); the alternate screen comes last
@@ -110,6 +112,13 @@ pub fn main(init: std.process.Init) !void {
             format = std.meta.stringToEnum(Format, f) orelse fatal("den: -o must be yaml or json, not {s}\n", .{f});
         } else fatal("den: unknown argument {s}\n" ++ usage, .{arg});
     }
+    // Inside a den, `den get` with no -f asks the den it runs in.
+    if (spec_opt == null and cmd == .get) if (std.c.getenv("DEN_SOCKET")) |env| {
+        const sock: [:0]const u8 = std.mem.span(env);
+        const name = std.fs.path.stem(sock);
+        const namespace = std.fs.path.basename(std.fs.path.dirname(sock) orelse "default");
+        return get(arena, .{ .metadata = .{ .name = name, .namespace = namespace } }, sock, format orelse .yaml);
+    };
     const path = spec_opt orelse fatal(usage, .{});
     if (format != null and cmd != .get) fatal("den: -o only applies to get\n", .{});
     if (color and cmd != .logs) fatal("den: --color only applies to logs\n", .{});
@@ -172,6 +181,7 @@ pub fn main(init: std.process.Init) !void {
         .log_path = log_path,
         .listen_fd = listen_fd,
         .size = undefined,
+        .source_url = try absolute(arena, path),
         .status_url = fetch.statusUrl(arena, path) catch null,
         .api_url = fetch.apiUrl(arena, path, "") catch null,
         .unix_socket = unix_socket,
@@ -184,6 +194,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     std.process.exit(0);
+}
+
+/// `path` with the working directory in front when it is a relative file
+/// path, so programs running elsewhere can read it; URLs as they are.
+fn absolute(a: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path) or std.mem.indexOf(u8, path, "://") != null) return path;
+    var buf: [std.posix.PATH_MAX]u8 = undefined;
+    _ = std.c.getcwd(&buf, buf.len) orelse return path;
+    return std.fs.path.join(a, &.{ std.mem.sliceTo(&buf, 0), path });
 }
 
 /// Connect to the den for `den` and send it one frame.
