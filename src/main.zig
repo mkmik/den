@@ -273,7 +273,10 @@ fn get(a: std.mem.Allocator, den: spec.Den, socket_path: [:0]const u8, format: F
     const resource = try std.json.parseFromSliceLeaky(std.json.Value, a, f.payload, .{});
     var w: std.Io.Writer.Allocating = .init(a);
     switch (format) {
-        .yaml => try yaml.write(&w.writer, resource),
+        .yaml => {
+            try w.writer.writeAll("---\n");
+            try yaml.write(&w.writer, resource);
+        },
         .json => {
             try std.json.Stringify.value(resource, .{ .whitespace = .indent_2 }, &w.writer);
             try w.writer.writeByte('\n');
