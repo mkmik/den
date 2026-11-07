@@ -356,6 +356,8 @@ pub const Server = struct {
     /// `unix_socket` if set; null when the spec came from a file.
     status_url: ?[]const u8 = null,
     unix_socket: ?[]const u8 = null,
+    /// The -f den was started with.
+    source_url: []const u8 = "",
     /// Nanoseconds between status PATCHes.
     status_interval: u64 = 5 * std.time.ns_per_s,
     pusher: ?Pusher = null,
@@ -903,6 +905,7 @@ pub const Server = struct {
             .cwd = st.cwd.?,
             .lastOutputTime = last,
             .observedGeneration = if (s.den.metadata.generation != 0) s.den.metadata.generation else null,
+            .source = if (s.source_url.len > 0) .{ .url = s.source_url, .unixSocket = s.unix_socket } else null,
         };
         if (patch) {
             const uid = s.den.metadata.uid;

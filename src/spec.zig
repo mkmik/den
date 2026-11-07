@@ -61,6 +61,16 @@ pub const Status = struct {
     lastOutputTime: ?[]const u8 = null,
     /// metadata.generation of the spec den runs, when it has one.
     observedGeneration: ?i64 = null,
+    /// Where the spec came from, so a program in the den can find the API
+    /// server (e.g. dennet) that runs it: `den get -o json`, then
+    /// .status.source.
+    source: ?Source = null,
+};
+
+/// The -f and --unix-socket den was started with, as given.
+pub const Source = struct {
+    url: []const u8,
+    unixSocket: ?[]const u8 = null,
 };
 
 /// The resource as read (unknown fields kept), with `status` set, as JSON.
