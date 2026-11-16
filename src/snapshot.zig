@@ -62,6 +62,9 @@ pub fn write(w: *Writer, term: *Terminal) Writer.Error!void {
 
     // The active screen with all terminal-wide state (modes, margins, cursor).
     const active = term.screens.active;
+    // Before the formatter: it sets modes (origin mode would skew our cursor
+    // moves) and leaves the cursor where the program had it.
+    try writeImages(w, active);
     var f: vt.formatter.TerminalFormatter = .init(term, .vt);
     f.content = .{ .selection = visible(active) };
     f.extra = .{
@@ -130,6 +133,73 @@ fn writeScrollback(w: *Writer, screen: *Screen) Writer.Error!void {
     // them up into scrollback before clearing the viewport.
     for (0..pages.rows) |_| try w.writeAll("\r\n");
     try w.writeAll(clear);
+}
+
+/// Kitty graphics on the visible rows: the formatter only writes cells, so
+/// images would vanish on reattach. Each image is sent once (a=t) and each of
+/// its placements is put back at its cell (a=p). q=2: no replies to the client.
+/// ponytail: visible rows only; placements in scrollback, relative (P=) and
+/// virtual (U=1) placements, and gray images (from PNGs) are dropped.
+fn writeImages(w: *Writer, screen: *Screen) Writer.Error!void {
+    const storage = &screen.kitty_images;
+    var sent: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer sent.deinit(screen.alloc);
+
+    var it = storage.placements.iterator();
+    while (it.next()) |e| {
+        const p = e.value_ptr;
+        const pin = switch (p.location) {
+            .pin => |pin| pin,
+            else => continue,
+        };
+        const pt = screen.pages.pointFromPin(.active, pin.*) orelse continue;
+        const id = e.key_ptr.image_id;
+        const img = storage.images.get(id) orelse continue;
+        const f: u8 = switch (img.format) {
+            .rgb => 24,
+            .rgba => 32,
+            else => continue,
+        };
+        const data = img.data.bytes() orelse continue;
+
+        const gop = sent.getOrPut(screen.alloc, id) catch return error.WriteFailed;
+        if (!gop.found_existing) {
+            try w.print("\x1b_Ga=t,q=2,i={d},f={d},s={d},v={d}", .{ id, f, img.width, img.height });
+            try writeChunked(w, data);
+        }
+
+        try w.print("\x1b[{d};{d}H\x1b_Ga=p,q=2,C=1,i={d}", .{ pt.active.y + 1, pt.active.x + 1, id });
+        const pid = e.key_ptr.placement_id;
+        if (pid.tag == .external) try w.print(",p={d}", .{pid.id});
+        inline for (.{
+            .{ "c", p.columns },  .{ "r", p.rows },
+            .{ "X", p.x_offset }, .{ "Y", p.y_offset },
+            .{ "x", p.source_x }, .{ "y", p.source_y },
+            .{ "w", p.source_width }, .{ "h", p.source_height },
+        }) |kv| if (kv[1] != 0) try w.print("," ++ kv[0] ++ "={d}", .{kv[1]});
+        if (p.z != 0) try w.print(",z={d}", .{p.z});
+        try w.writeAll("\x1b\\");
+    }
+    // Callers expect the cursor home, where `clear` left it.
+    if (sent.count() > 0) try w.writeAll("\x1b[H");
+}
+
+/// Finish an APC whose keys are already written: base64 `data` in chunks of
+/// at most 4096 encoded bytes, as the protocol requires (m=1 means more).
+fn writeChunked(w: *Writer, data: []const u8) Writer.Error!void {
+    const enc = std.base64.standard.Encoder;
+    var buf: [4096]u8 = undefined;
+    var rest = data;
+    var first = true;
+    while (true) {
+        const n = @min(rest.len, 3072);
+        const more = n < rest.len;
+        if (!first) try w.writeAll("\x1b_G");
+        try w.print("{s}m={d};{s}\x1b\\", .{ if (first) "," else "", @intFromBool(more), enc.encode(&buf, rest[0..n]) });
+        rest = rest[n..];
+        first = false;
+        if (!more) return;
+    }
 }
 
 /// Reset style, home the cursor, erase the viewport.
@@ -276,6 +346,41 @@ test "title and pwd are replayed" {
     defer dst.deinit(testing.allocator);
     try testing.expectEqualStrings("my title", dst.getTitle().?);
     try testing.expectEqualStrings("file://h/tmp", dst.getPwd().?);
+}
+
+test "kitty images on the visible screen are replayed" {
+    // A 1x4 RGBA image, put at row 3 col 2 and stretched over 10x1 cells,
+    // the way ~/bin/hr draws a rule.
+    var src = try newTerm(20, 5, "a\r\nb\r\n\x1b[3;2H\x1b_Ga=T,f=32,s=1,v=4,c=10,r=1,C=1,q=2;" ++
+        "AAAAAAAAAACAgID/AAAAAA==\x1b\\x");
+    defer src.deinit(testing.allocator);
+    try testing.expectEqual(1, src.screens.active.kitty_images.placements.count());
+
+    var dst = try replay(&src);
+    defer dst.deinit(testing.allocator);
+    try expectSameScreen(&src, &dst);
+    const st = &dst.screens.active.kitty_images;
+    try testing.expectEqual(1, st.placements.count());
+    var it = st.placements.iterator();
+    const e = it.next().?;
+    try testing.expectEqual(10, e.value_ptr.columns);
+    try testing.expectEqual(1, e.value_ptr.rows);
+    const pt = dst.screens.active.pages.pointFromPin(.active, e.value_ptr.location.pin.*).?;
+    try testing.expectEqual(1, pt.active.x);
+    try testing.expectEqual(2, pt.active.y);
+    const img = st.images.get(e.key_ptr.image_id).?;
+    try testing.expectEqualSlices(u8, src.screens.active.kitty_images.images.get(e.key_ptr.image_id).?.data.bytes().?, img.data.bytes().?);
+}
+
+test "large images are sent in 4096-byte chunks" {
+    var a: Writer.Allocating = .init(testing.allocator);
+    defer a.deinit();
+    const big: [7000]u8 = @splat(7);
+    try writeChunked(&a.writer, &big);
+    try testing.expectEqual(3, std.mem.count(u8, a.written(), "\x1b\\"));
+    try testing.expect(std.mem.indexOf(u8, a.written(), "m=1;") != null);
+    try testing.expect(std.mem.endsWith(u8, a.written(), "\x1b\\"));
+    try testing.expectEqual(2, std.mem.count(u8, a.written(), "\x1b_Gm="));
 }
 
 test text {
