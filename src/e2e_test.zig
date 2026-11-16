@@ -435,6 +435,43 @@ test "typing makes a client's size win" {
     } else return error.SizeNotTaken;
 }
 
+// The last client leaving keeps its size, so the same window attaching
+// again finds nothing to resize.
+test "the size stays after the last client leaves" {
+    var dir_buf: [64]u8 = undefined;
+    const runtime = try std.fmt.bufPrint(&dir_buf, "/tmp/den-test-k{d}", .{std.c.getpid()});
+    try sys.mkdirAll(runtime);
+    defer std.Io.Dir.cwd().deleteTree(testing.io, runtime) catch {};
+    try spawnDen(runtime, "ks", &.{ "/bin/sh", "-c", "while read x; do echo \"$x $(stty size)\"; done" }, "0s");
+    const sock = try std.fmt.allocPrint(gpa, "{s}/den/test/ks.sock", .{runtime});
+    defer gpa.free(sock);
+    defer if (sys.connectUnix(sock)) |fd| {
+        var k: Conn = .{ .fd = fd };
+        defer k.close();
+        k.send(.shutdown, &.{}) catch {};
+        while (true) _ = k.next() catch break;
+    } else |_| {};
+
+    {
+        var a = try Conn.open(sock);
+        defer a.close();
+        try a.attach(100, 30);
+        try testing.expectEqual(proto.Type.snapshot, (try a.next()).type);
+        try a.send(.detach, &.{});
+    }
+    // Typed without attaching, as den send does.
+    var b = try Conn.open(sock);
+    defer b.close();
+    try b.send(.input, &.{"two\r"});
+
+    for (0..100) |_| {
+        const h = try history(sock);
+        defer gpa.free(h);
+        if (std.mem.indexOf(u8, h, "two 30 100") != null) break;
+        sys.sleepMs(20);
+    } else return error.SizeNotKept;
+}
+
 // `den attach` on a real terminal: it asks the terminal about itself, shows
 // the program, types into it, and Ctrl-\ detaches while the program runs on.
 test "attach types into the program and Ctrl-\\ detaches" {

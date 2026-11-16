@@ -807,19 +807,22 @@ pub const Server = struct {
         }
     }
 
-    /// The most recent read-write client sets the size; with none attached,
-    /// the spec's size applies.
+    /// The most recent read-write client sets the size. When the last one
+    /// leaves, the size stays: the next client is most often the same window
+    /// coming back (its app restarting), and shrinking to the spec's size in
+    /// between would make the program redraw and the shell rewrap twice.
     fn applySize(s: *Server) !void {
-        var want: proto.Size = .{ .cols = s.den.spec.size.cols, .rows = s.den.spec.size.rows };
+        var want: ?proto.Size = null;
         var best: u64 = 0;
         for (s.clients.items) |cl| if (cl.attached and cl.rw and !cl.dead and cl.seq > best) {
             best = cl.seq;
             want = cl.size;
         };
+        const w = want orelse return;
         // After exit the final screen keeps the size it had.
-        if (std.meta.eql(want, s.size) or !s.live) return;
-        s.size = want;
-        try s.term.resize(s.gpa, .{ .cols = want.cols, .rows = want.rows });
+        if (std.meta.eql(w, s.size) or !s.live) return;
+        s.size = w;
+        try s.term.resize(s.gpa, .{ .cols = w.cols, .rows = w.rows });
         if (s.master >= 0) sys.setWinsize(s.master, s.winsize());
     }
 
