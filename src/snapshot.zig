@@ -172,9 +172,9 @@ fn writeImages(w: *Writer, screen: *Screen) Writer.Error!void {
         const pid = e.key_ptr.placement_id;
         if (pid.tag == .external) try w.print(",p={d}", .{pid.id});
         inline for (.{
-            .{ "c", p.columns },  .{ "r", p.rows },
-            .{ "X", p.x_offset }, .{ "Y", p.y_offset },
-            .{ "x", p.source_x }, .{ "y", p.source_y },
+            .{ "c", p.columns },      .{ "r", p.rows },
+            .{ "X", p.x_offset },     .{ "Y", p.y_offset },
+            .{ "x", p.source_x },     .{ "y", p.source_y },
             .{ "w", p.source_width }, .{ "h", p.source_height },
         }) |kv| if (kv[1] != 0) try w.print("," ++ kv[0] ++ "={d}", .{kv[1]});
         if (p.z != 0) try w.print(",z={d}", .{p.z});
