@@ -78,7 +78,7 @@ spec:
   - name: FOO
     value: bar
   inheritEnv: ["LANG", "LC_*", "SSH_AUTH_SOCK"]  # copied from the environment of `den apply`
-  size: {cols: 120, rows: 40}     # used while no client is attached
+  size: {cols: 120, rows: 40}     # until the first client attaches; the last client's size stays after it leaves
   paused: false                   # SIGSTOP / SIGCONT
   history:
     memoryLines: 5000             # scrollback kept in libghostty-vt
@@ -169,7 +169,7 @@ program.
 
 | Field | Effect of a change |
 |---|---|
-| `size` | Resize the PTY and the emulator, only while no client is attached |
+| `size` | None for the running process: the size at start, kept until a client attaches |
 | `paused` | Send SIGSTOP or SIGCONT |
 | `history.*` | Apply on the next scrollback trim or log rotation |
 | `report.*` | Apply on the next status write |
