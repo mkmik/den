@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const c = std.c;
+const sys = @import("sys.zig");
 
 /// The state format this den writes. Bump it when a new den could not
 /// read what an old den wrote, and keep reading older formats.
@@ -190,10 +191,28 @@ pub fn probe(path: [:0]const u8, timeout_ms: u32) !void {
         if (n <= 0) break;
         len += @intCast(n);
     }
-    // Still running (no answer, or one that does not end): stop it.
-    if (timed_out or len == buf.len) _ = c.kill(pid, .KILL);
+    // It closed its output: give it until the deadline to exit. A blocking
+    // wait here would freeze den if it keeps running.
     var status: c_int = 0;
-    while (c.waitpid(pid, &status, 0) < 0 and c.errno(@as(c_int, -1)) == .INTR) {}
+    var reaped = false;
+    if (!timed_out and len < buf.len) while (true) {
+        const r = c.waitpid(pid, &status, c.W.NOHANG);
+        if (r == pid) {
+            reaped = true;
+            break;
+        }
+        if (r < 0 and c.errno(r) != .INTR) break;
+        if (nowMs() >= deadline) {
+            timed_out = true;
+            break;
+        }
+        sys.sleepMs(5);
+    };
+    // Still running (no answer, one that does not end, or no exit): stop it.
+    if (!reaped) {
+        _ = c.kill(pid, .KILL);
+        while (c.waitpid(pid, &status, 0) < 0 and c.errno(@as(c_int, -1)) == .INTR) {}
+    }
     if (timed_out) return error.Timeout;
     const st: u32 = @bitCast(status);
     if (!c.W.IFEXITED(st) or c.W.EXITSTATUS(st) != 0) return error.NotDen;
@@ -370,6 +389,8 @@ test probe {
         .{ .script = "echo 'den-handoff 2'", .want = error.NotDen },
         .{ .script = "echo 'den-handoff 1'; exit 1", .want = error.NotDen },
         .{ .script = "exec sleep 10", .want = error.Timeout },
+        // Answers and closes its output, but does not exit.
+        .{ .script = "echo 'den-handoff 1'; exec >&-; exec sleep 10", .want = error.Timeout },
     };
     for (cases, 0..) |case, i| {
         var path_buf: [96]u8 = undefined;
