@@ -212,7 +212,8 @@ test read {
     try testing.expectError(error.UnsupportedUrl, read(testing.allocator, arena, io, "ftp://h/den.json", null, &status));
 
     // HTTP over a Unix socket, chunked; then a 404.
-    const sock = try std.fmt.allocPrint(arena, "{s}/api.sock", .{dir});
+    const sock = try testSock(arena, "r");
+    defer _ = std.c.unlink(sock);
     const ua = try Io.net.UnixAddress.init(sock);
     var us = try ua.listen(io, .{});
     defer us.deinit(io);
@@ -287,6 +288,14 @@ test apiUrl {
     try testing.expectEqual(null, try apiUrl(a, "file:///abs/den.yaml", p));
 }
 
+/// A socket path in /tmp: one under the test's tmpDir can pass the
+/// ~104-byte sun_path limit when the checkout path is long.
+fn testSock(arena: std.mem.Allocator, tag: []const u8) ![:0]u8 {
+    const p = try std.fmt.allocPrintSentinel(arena, "/tmp/den-fetch-{s}{d}.sock", .{ tag, std.c.getpid() }, 0);
+    _ = std.c.unlink(p);
+    return p;
+}
+
 /// What servePatch got: "METHOD target content-type body".
 var patch_got: [512]u8 = undefined;
 var patch_got_len: usize = 0;
@@ -319,10 +328,8 @@ test patch {
     defer client.deinit();
     const want = "PATCH /dens/x/status application/merge-patch+json {\"status\":{\"phase\":\"Running\"}}";
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    const sock = try std.fmt.allocPrint(arena, "{s}/api.sock", .{dir});
+    const sock = try testSock(arena, "p");
+    defer _ = std.c.unlink(sock);
     var us = try (try Io.net.UnixAddress.init(sock)).listen(io, .{});
     defer us.deinit(io);
     {
