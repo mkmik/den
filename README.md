@@ -16,7 +16,7 @@ Needs Zig 0.17.
     zig build test     # unit tests plus an end-to-end test of the real binary
 
 Or use `just` (run `just` to list recipes): `just build`, `just test`,
-`just release`, `just linux aarch64`, `just run apply -f examples/den.yaml`.
+`just release`, `just install`, `just linux aarch64`, `just run apply -f examples/den.yaml`.
 
 ## Run
 

@@ -10,6 +10,12 @@ build:
 release:
     zig build -Doptimize=ReleaseSafe
 
+# Release build, installed as ~/bin/den. rm first: overwriting a signed
+# binary in place makes macOS kill it on the next run.
+install dir="~/bin": release
+    rm -f {{dir}}/den
+    cp zig-out/bin/den {{dir}}/den
+
 # Unit tests plus the end-to-end test against the real binary.
 test:
     zig build test --summary all
