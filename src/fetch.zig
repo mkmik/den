@@ -138,7 +138,7 @@ fn httpUnix(arena: std.mem.Allocator, io: Io, sock: []const u8, host: []const u8
     try w.interface.flush();
     var rbuf: [16 * 1024]u8 = undefined;
     var r = stream.reader(io, &rbuf);
-    var hr: std.http.Reader = .{ .in = &r.interface, .interface = undefined, .state = .ready, .max_head_len = rbuf.len };
+    var hr: std.http.Reader = .{ .in = &r.interface, .interface = undefined, .state = .ready, .max_head_len = rbuf.len, .side = .response };
     return body(arena, &hr, try Head.parse(try hr.receiveHead()), status);
 }
 
