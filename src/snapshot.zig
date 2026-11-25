@@ -22,6 +22,11 @@ const alt_modes = [_]vt.modes.Mode{
     .alt_screen_legacy, // 47
 };
 
+/// Soft-wrapped rows go out unbroken, so the client wraps them itself and
+/// rewraps them when it resizes. Broken with \r\n they would stay cut at the
+/// width den had when the client attached.
+const unwrapped: vt.formatter.Options = .{ .emit = .vt, .unwrap = true };
+
 pub fn encode(alloc: std.mem.Allocator, term: *Terminal) ![]u8 {
     var out: Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -48,7 +53,7 @@ pub fn write(w: *Writer, term: *Terminal) Writer.Error!void {
 
     if (term.screens.active_key == .alternate) {
         // Main screen's visible rows and cursor, then switch.
-        var f: vt.formatter.ScreenFormatter = .init(primary, .vt);
+        var f: vt.formatter.ScreenFormatter = .init(primary, unwrapped);
         f.content = .{ .selection = visible(primary) };
         f.extra = .all;
         try f.format(w);
@@ -65,7 +70,7 @@ pub fn write(w: *Writer, term: *Terminal) Writer.Error!void {
     // Before the formatter: it sets modes (origin mode would skew our cursor
     // moves) and leaves the cursor where the program had it.
     try writeImages(w, active);
-    var f: vt.formatter.TerminalFormatter = .init(term, .vt);
+    var f: vt.formatter.TerminalFormatter = .init(term, unwrapped);
     f.content = .{ .selection = visible(active) };
     f.extra = .{
         .palette = false,
@@ -125,7 +130,7 @@ fn writeScrollback(w: *Writer, screen: *Screen) Writer.Error!void {
     var bottom = active_top.up(1) orelse return;
     bottom.x = @intCast(pages.cols - 1);
 
-    var f: vt.formatter.ScreenFormatter = .init(screen, .vt);
+    var f: vt.formatter.ScreenFormatter = .init(screen, unwrapped);
     f.content = .{ .selection = vt.Selection.init(top, bottom, false) };
     try f.format(w);
 
@@ -397,4 +402,21 @@ test text {
     try testing.expect(std.mem.indexOf(u8, color, "\x1b[") != null);
     try testing.expect(std.mem.endsWith(u8, color, "\x1b[0m\n"));
     try testing.expect(std.mem.indexOf(u8, color, "\r") == null);
+}
+
+// A client that attaches while small (a window not laid out yet, or a small
+// one), then grows: soft-wrapped rows, in history and on screen, must rewrap
+// to the new width, not stay cut at the old one.
+test "long lines rewrap when the client grows" {
+    const long = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
+    var src = try newTerm(20, 5, long ++ "\r\n" ++ lines50 ++ long ++ "\r\n$ ");
+    defer src.deinit(testing.allocator);
+    var dst = try replay(&src);
+    defer dst.deinit(testing.allocator);
+    try expectSameScreen(&src, &dst);
+    try dst.resize(testing.allocator, .{ .cols = 80, .rows = 5 });
+    const got = try dump(&dst);
+    defer testing.allocator.free(got);
+    // Once in history, once on screen.
+    try testing.expectEqual(2, std.mem.count(u8, got, long ++ "\n"));
 }
