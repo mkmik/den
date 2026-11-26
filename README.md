@@ -170,8 +170,8 @@ sequence, den waits for it to finish (up to 2 seconds). Dens started before
 `den upgrade` existed cannot be upgraded; restart them with `den delete`, then
 `den apply`.
 
-What does not carry over: a cursor position saved with DECSC (ESC 7), images,
-and shell prompt marks. These only affect what a client that attaches after the
+What does not carry over: a cursor position saved with DECSC (ESC 7), images
+outside the visible screen, and shell prompt marks. These only affect what a client that attaches after the
 upgrade sees.
 
 ## Protocol
