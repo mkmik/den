@@ -507,6 +507,8 @@ test "attach types into the program and Ctrl-\\ detaches" {
     if (pid == 0) {
         _ = sys.setenv("XDG_RUNTIME_DIR", rt, 1);
         _ = sys.setenv("XDG_STATE_HOME", state, 1);
+        // Tests may run inside a den, where attach refuses to start.
+        _ = sys.unsetenv("DEN_SOCKET");
         // Some shells leave the terminal non-blocking; attach must cope.
         sys.setNonblock(1) catch {};
         _ = sys.execvp(bin, &argv);
@@ -1315,6 +1317,8 @@ test "den attach carries on through an upgrade" {
     if (pid == 0) {
         _ = sys.setenv("XDG_RUNTIME_DIR", rt, 1);
         _ = sys.setenv("XDG_STATE_HOME", state, 1);
+        // Tests may run inside a den, where attach refuses to start.
+        _ = sys.unsetenv("DEN_SOCKET");
         _ = sys.execvp(bin, &argv);
         std.c._exit(127);
     }
@@ -1442,10 +1446,11 @@ test "an upgraded den keeps reporting its status and its Lease" {
         defer gpa.free(r);
         try testing.expectEqual(@as(u8, 1), r[0]);
     }
-    // The new den applies the Lease too.
-    const before = b.applied.load(.acquire);
+    // Each den applies the Lease when it starts, the first one and the two
+    // after upgrades, and only renews it 10s later. Counting from after the
+    // upgrades would miss an apply that came first.
     for (0..250) |_| {
-        if (b.applied.load(.acquire) > before) break;
+        if (b.applied.load(.acquire) >= 3) break;
         sys.sleepMs(20);
     } else return error.Timeout;
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = stop, .data = "" });

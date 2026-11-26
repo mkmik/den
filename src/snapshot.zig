@@ -27,6 +27,10 @@ const masked_modes = alt_modes ++ [_]vt.modes.Mode{.synchronized_output};
 /// Soft-wrapped rows go out unbroken, so the client wraps them itself and
 /// rewraps them when it resizes. Broken with \r\n they would stay cut at the
 /// width den had when the client attached.
+/// den's own emulator needs the same after `den upgrade`, or `den logs` would
+/// split the lines.
+// ponytail: a line that wraps from scrollback into the viewport still gets a
+// break at that edge (writeScrollback clears the viewport between them).
 const unwrapped: vt.formatter.Options = .{ .emit = .vt, .unwrap = true };
 
 /// Who plays the snapshot back.
@@ -57,6 +61,12 @@ pub fn write(w: *Writer, term: *Terminal, for_: For) Writer.Error!void {
         term.modes.set(m, false);
     }
     defer for (masked, 0..) |m, i| term.modes.set(m, saved[i]);
+    // Rows go out unwrapped (see `unwrapped`), so the terminal that plays them
+    // back must wrap them. The formatter writes modes before the rows, so
+    // autowrap stays on for them and goes off after, if the program set it so.
+    const autowrap = term.modes.get(.wraparound);
+    term.modes.set(.wraparound, true);
+    defer term.modes.set(.wraparound, autowrap);
 
     try writeColorOverrides(w, term);
 
@@ -95,6 +105,7 @@ pub fn write(w: *Writer, term: *Terminal, for_: For) Writer.Error!void {
         .screen = .all,
     };
     try f.format(w);
+    if (!autowrap) try w.writeAll("\x1b[?7l");
 
     if (term.getPwd()) |pwd| if (pwd.len > 0) try w.print("\x1b]7;{s}\x1b\\", .{pwd});
     if (term.getTitle()) |title| try w.print("\x1b]2;{s}\x07", .{title});
@@ -521,6 +532,35 @@ test "handoff snapshot with pending wrap" {
     feed(&src, "x");
     feed(&dst, "x");
     try expectSameState(&src, &dst);
+}
+
+test "snapshots keep soft-wrapped lines whole" {
+    // 15 characters on a 10-column screen: one line in two rows. Also in
+    // scrollback, and with autowrap turned off afterwards.
+    const input = "123456789012345\r\n" ++ lines50 ++ "abcdefghijklmno\r\nshort\r\n\x1b[?7l";
+    var src = try newTerm(10, 4, input);
+    defer src.deinit(testing.allocator);
+    for ([_]For{ .handoff, .client }) |for_| {
+        const snap = try encode(testing.allocator, &src, for_);
+        defer testing.allocator.free(snap);
+        var dst = try newTerm(10, 4, snap);
+        defer dst.deinit(testing.allocator);
+        const want = try text(testing.allocator, &src, false);
+        defer testing.allocator.free(want);
+        const got = try text(testing.allocator, &dst, false);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want, got);
+        try testing.expect(std.mem.indexOf(u8, got, "123456789012345\n") != null);
+        try testing.expect(std.mem.indexOf(u8, got, "abcdefghijklmno\nshort") != null);
+        try testing.expect(!dst.modes.get(.wraparound));
+
+        // A wider screen reflows the line onto one row (only with autowrap on).
+        feed(&dst, "\x1b[?7h");
+        try dst.resize(testing.allocator, .{ .cols = 20, .rows = 4 });
+        const wide = try dst.screens.active.dumpStringAlloc(testing.allocator, .{ .viewport = .{} });
+        defer testing.allocator.free(wide);
+        try testing.expect(std.mem.indexOf(u8, wide, "abcdefghijklmno\nshort") != null);
+    }
 }
 
 test "client snapshot leaves palette, tabstops and synchronized output out" {

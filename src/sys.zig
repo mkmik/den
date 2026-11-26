@@ -10,6 +10,7 @@ pub extern "c" fn forkpty(master: *c_int, name: ?[*:0]u8, termp: ?*const anyopaq
 pub extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 pub extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
 pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+pub extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 const TIOCSWINSZ: u32 = if (@import("builtin").os.tag.isDarwin()) 0x80087467 else c.T.IOCSWINSZ;
 
